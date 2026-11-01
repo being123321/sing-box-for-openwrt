@@ -1,0 +1,154 @@
+#!/usr/bin/python3
+import fcntl,json,os,pathlib,socket,struct,subprocess as sp,sys,time
+from router_platform import api_url
+D=pathlib.Path('/etc/sb-router')
+state=D/'dns-before-proxy.json'
+section='dhcp.@dnsmasq[0]'
+target='127.0.0.1#15353'
+intent=pathlib.Path('/tmp/sb-router-wanted')
+incident=D/'network-fallback.json'
+
+def log(message):
+    sp.run(['logger','-t','sb-network-guard',message],timeout=5)
+
+def core_running(config):
+    expected=os.fsencode(D/config)
+    for proc in pathlib.Path('/proc').glob('[0-9]*'):
+        try:
+            if expected in (proc/'cmdline').read_bytes().split(b'\0') and os.path.samefile(proc/'exe',D/'core'):
+                return True
+        except OSError:pass
+    return False
+
+def internal_health():
+    if not pathlib.Path('/sys/class/net/sb-zh').exists() or not core_running('tun.json'):
+        return False,'网络接管进程或接口异常'
+    if not core_running('active.json'):
+        return False,'代理后台进程未运行'
+    if not resolver_alive():
+        return False,'代理 DNS 未响应'
+    if not resolver_alive(('172.29.254.2',53)):
+        return False,'网络接管转发未响应'
+    try:
+        with socket.create_connection(('127.0.0.1',18082),timeout=2) as sock:
+            sock.sendall(b'\x05\x01\x00')
+            if sock.recv(2)!=b'\x05\x00':return False,'代理转发接口未响应'
+        token=(D/'token').read_text().strip()
+        r=sp.run(['curl','--noproxy','*','-fsS','--max-time','2','-H','Authorization: Bearer '+token,
+                  api_url('/version')],capture_output=True,timeout=4)
+        if r.returncode:return False,'代理管理接口未响应'
+    except (OSError,sp.TimeoutExpired):
+        return False,'代理本地接口检测失败'
+    return True,''
+
+def cleanup_capture():
+    # Remove only the TUN front end's rules. Never flush the router firewall.
+    cfg=json.loads((D/'tun.json').read_text())
+    tun=next(x for x in cfg['inbounds'] if x.get('interface_name')=='sb-zh')
+    table=int(tun.get('iproute2_table_index',2022))
+    pref=int(tun.get('iproute2_rule_index',9000))
+    owned=sp.run(['nft','list','table','inet','sing-box'],capture_output=True,text=True,timeout=5)
+    if owned.returncode==0:
+        if '"sb-zh"' not in owned.stdout:raise RuntimeError('规则表归属不匹配，未删除')
+        sp.run(['nft','delete','table','inet','sing-box'],check=True,timeout=5)
+    for family in ('-4','-6'):
+        rules=sp.run(['ip',family,'rule','show'],capture_output=True,text=True,check=True,timeout=5).stdout
+        for line in rules.splitlines():
+            number,_,body=line.partition(':')
+            words=body.split()
+            expected=[
+                ['from','all','fwmark','0x2024/0x2027','goto',str(pref+2)],
+                ['from','all','fwmark','0x2023/0x2027','lookup',str(table)],
+                ['not','from','all','fwmark','0x2024/0x2027','lookup',str(table)]]
+            is_nop=int(number)==pref+2 and words==['from','all','nop']
+            if words in expected or is_nop:
+                sp.run(['ip',family,'rule','del','pref',number.strip()]+words,check=True,timeout=5)
+        sp.run(['ip',family,'route','flush','table',str(table),'dev','sb-zh'],capture_output=True,timeout=5)
+    if pathlib.Path('/sys/class/net/sb-zh').exists():
+        sp.run(['ip','link','delete','dev','sb-zh'],check=True,timeout=5)
+
+def fallback(reason):
+    errors=[]
+    try:
+        sp.run(['/etc/init.d/sb-router','stop'],check=True,timeout=20,capture_output=True)
+    except Exception as e:errors.append('停止接管：'+str(e))
+    intent.unlink(missing_ok=True)
+    try:cleanup_capture()
+    except Exception as e:errors.append('清理接管：'+str(e))
+    try:set_mode(False)
+    except Exception as e:errors.append('恢复 DNS：'+str(e))
+    data={'time':int(time.time()),'reason':reason,'restored':not errors,'errors':errors}
+    tmp=incident.with_suffix('.tmp')
+    tmp.write_text(json.dumps(data,ensure_ascii=False));tmp.chmod(0o600);os.replace(tmp,incident)
+    log('故障自动直连完成' if not errors else '故障恢复需要检查：'+'；'.join(errors))
+    return data
+
+def watch():
+    failed_since=None
+    while True:
+        try:
+            desired=intent.exists() or pathlib.Path('/sys/class/net/sb-zh').exists()
+            if not desired:
+                failed_since=None
+                set_mode(False)
+            else:
+                good,reason=internal_health()
+                if good:
+                    intent.touch(exist_ok=True)
+                    failed_since=None
+                    set_mode(True)
+                else:
+                    with (D/'lock').open('a') as lock:
+                        try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                        except BlockingIOError:
+                            # Configuration updates already validate and roll back under this lock.
+                            failed_since=None
+                        else:
+                            if failed_since is None:failed_since=time.monotonic()
+                            if time.monotonic()-failed_since>=20:
+                                log('持续运行异常，解除网络接管：'+reason)
+                                fallback(reason)
+                                failed_since=None
+        except Exception as e:log('保护检查异常：'+type(e).__name__)
+        time.sleep(3)
+def uci(*args):
+    return sp.run(['uci','-q',*args],capture_output=True,text=True)
+def resolver_alive(address=('127.0.0.1',15353)):
+    try:
+        with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as s:
+            s.settimeout(1)
+            s.sendto(struct.pack('!6H',8462,256,1,0,0,0)+b'\x03www\x07youtube\x03com\0\0\x1c\0\x01',address)
+            answer=s.recv(2048)
+            return answer[:2]==struct.pack('!H',8462)
+    except OSError:return False
+def set_mode(up):
+    with open('/tmp/sb-dns-transition.lock','w') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        current=uci('get',section+'.server').stdout.split()
+        if up and state.exists() and target in current:return
+        if not up and not state.exists():return
+        if up:
+            if not state.exists():
+                state.write_text(json.dumps({'servers':current,'noresolv':uci('get',section+'.noresolv').stdout.strip()}))
+            values=[v for v in current if v.startswith('/')]+[target]; noresolv='1'
+        else:
+            old=json.loads(state.read_text());values=old['servers'];noresolv=old['noresolv']
+        uci('delete',section+'.server')
+        for v in values:
+            uci('add_list',section+'.server='+v).check_returncode()
+        if noresolv:uci('set',section+'.noresolv='+noresolv).check_returncode()
+        else:uci('delete',section+'.noresolv')
+        uci('commit','dhcp').check_returncode()
+        for p in pathlib.Path('/tmp').glob('dnsmasq.*.d/sb-router-dns.conf'):p.unlink()
+        sp.run(['/etc/init.d/dnsmasq','restart'],check=True,stdout=sp.DEVNULL,stderr=sp.DEVNULL)
+        if not up:state.unlink(missing_ok=True)
+if __name__=='__main__':
+    mode=sys.argv[1]
+    if mode=='watch':watch()
+    elif mode=='up':
+        for i in range(25):
+            if pathlib.Path('/sys/class/net/sb-zh').exists() and resolver_alive():break
+            time.sleep(.4)
+        else:sys.exit(1)
+        set_mode(True)
+    else:set_mode(False)

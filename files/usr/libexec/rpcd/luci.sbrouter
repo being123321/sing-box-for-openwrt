@@ -1,0 +1,54 @@
+#!/usr/bin/python3
+import json, os, pathlib, secrets, subprocess, sys
+M = '/etc/sb-router/manage'
+methods = {
+    'kernel': {'mode': '', 'source': '', 'channel': '', 'version': '', 'sha256': ''},
+    'readprofile': {'name': ''}, 'editprofile': {'name': '', 'dest': '', 'revision': '', 'value': '', 'url': '', 'source': False},
+    'nodes': {'name': '', 'value': '', 'new': True},
+    'schedule': {'kind': 'nodes', 'enabled': True, 'mode': 'daily', 'weekday': 1, 'day': 1, 'hour': 0, 'minute': 0},
+    'autostart': {'enabled': True}, 'refresh': {}, 'start': {}, 'stop': {}, 'restart': {}, 'status': {}, 'token': {},
+    'job': {'id': ''}, 'link': {'name': '', 'value': ''}, 'upload': {'name': '', 'value': ''}, 'apply': {'name': ''},
+    'profiles': {}, 'logs': {'lines': 300}, 'panel': {}, 'panel-set': {'id': '', 'url': ''},
+    'node-list': {'name': ''}, 'node-delay': {'name': ''}, 'node-get': {'name': '', 'tag': ''},
+    'node-set': {'name': '', 'tag': '', 'value': ''}, 'node-del': {'name': '', 'tag': ''},
+    'delete': {'name': ''}, 'sublink': {'name': '', 'url': '', 'new': True}, 'refresh-counts': {}, 'base-mode': {'mode': ''}, 'token-set': {'token': ''},
+    'sub-list': {}, 'sub-add': {'name': '', 'url': ''}, 'sub-del': {'name': ''}, 'sub-refresh': {'name': ''},
+}
+methods.update({'catalog': {}, 'catalog-get': {'id': ''}, 'catalog-set': {'id': '', 'value': ''}, 'catalog-del': {'id': ''}, 'manual-add': {'value': ''}, 'import-inspect': {'url': '', 'value': ''}, 'import-commit': {'ticket': '', 'name': '', 'mode': ''}, 'catalog-delay': {'scope': 'all'}, 'update-options': {}, 'update-selection': {'selected': '[]'}, 'update-selected': {}, 'update-policy': {'selected': '[]', 'enabled': True, 'mode': 'daily', 'weekday': 1, 'day': 1, 'hour': 2, 'minute': 0}})
+SYNC = {'status', 'token', 'logs', 'profiles', 'panel', 'node-list', 'node-get', 'sub-list', 'catalog', 'catalog-get', 'update-options'}
+if sys.argv[1] == 'list':
+    print(json.dumps(methods))
+    sys.exit()
+method = sys.argv[2]
+if method not in methods:
+    sys.exit(1)
+arg = json.load(sys.stdin)
+if method in SYNC:
+    p = subprocess.run([M, 'call', method], input=json.dumps(arg).encode(), capture_output=True)
+    print(p.stdout.decode() or '{"error":"Operation failed"}')
+    sys.exit()
+jobs = pathlib.Path('/tmp/sb-router-jobs')
+jobs.mkdir(mode=0o700, exist_ok=True)
+if method == 'job':
+    jid = arg['id']
+    if len(jid) != 24 or any(c not in '0123456789abcdef' for c in jid):
+        sys.exit(1)
+    f = jobs / jid
+    if f.exists():
+        print(f.read_text())
+        f.unlink(missing_ok=True)
+    else:
+        print('{"pending":true}')
+    sys.exit()
+jid = secrets.token_hex(12)
+if not os.fork():
+    os.setsid()
+    with open('/dev/null', 'rb+') as null:
+        for fd in range(3):
+            os.dup2(null.fileno(), fd)
+    p = subprocess.run([M, 'call', method], input=json.dumps(arg).encode(), capture_output=True)
+    tmp = jobs / (jid + '.tmp')
+    tmp.write_bytes(p.stdout or b'{"error":"Operation failed"}')
+    tmp.rename(jobs / jid)
+    os._exit(0)
+print(json.dumps({'id': jid}))

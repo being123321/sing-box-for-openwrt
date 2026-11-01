@@ -1,0 +1,68 @@
+{
+  "luci-app-sb-router": {
+    "description": "sing-box router management",
+    "read": {
+      "ubus": {
+        "luci.sbrouter": [
+          "status",
+          "logs",
+          "profiles",
+          "panel",
+          "node-list",
+          "node-get",
+          "sub-list"
+        ]
+      }
+    },
+    "write": {
+      "ubus": {
+        "luci.sbrouter": [
+          "kernel",
+          "readprofile",
+          "editprofile",
+          "nodes",
+          "schedule",
+          "autostart",
+          "refresh",
+          "start",
+          "stop",
+          "token",
+          "link",
+          "upload",
+          "apply",
+          "job",
+          "node-delay",
+          "node-set",
+          "node-del",
+          "delete",
+          "sublink",
+          "panel-set",
+          "refresh-counts",
+          "base-mode",
+          "token-set",
+          "sub-add",
+          "sub-del",
+          "sub-refresh",
+          "restart",
+          "catalog",
+          "catalog-get",
+          "catalog-set",
+          "catalog-del",
+          "manual-add",
+          "import-inspect",
+          "import-commit",
+          "catalog-delay",
+          "update-options",
+          "update-selection",
+          "update-selected",
+          "update-policy"
+        ]
+      },
+      "file": {
+        "/tmp/sb-router-core-upload": [
+          "write"
+        ]
+      }
+    }
+  }
+}

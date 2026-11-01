@@ -1,0 +1,20 @@
+#!/bin/sh /etc/rc.common
+# Restore the previous kernel if an update was interrupted by power loss or a crash.
+START=94
+STOP=11
+
+boot() {
+    python3 /etc/sb-router/core_update.py recover force >/dev/null 2>&1
+}
+
+start() {
+    boot
+}
+
+stop() {
+    :
+}
+
+restart() {
+    boot
+}

@@ -1,0 +1,1729 @@
+#!/usr/bin/python3
+import base64, fcntl, hashlib, json, os, pathlib, re, secrets, shutil, subprocess as sp, sys, tempfile, time, urllib.parse
+
+from router_platform import lan_address, api_url
+LAN = lan_address()
+D = pathlib.Path('/etc/sb-router')
+profiles = D / 'profiles'
+profiles.mkdir(mode=0o700, exist_ok=True)
+os.umask(0o077)
+
+PROXY_TYPES = {'hysteria2', 'vless', 'vmess', 'trojan', 'shadowsocks', 'tuic', 'hysteria', 'anytls', 'shadowtls', 'snell'}
+NON_NODE_TAGS = {'DIRECT', 'REJECT', 'PROXY', 'AUTO', 'proxy', 'direct', 'block'}
+BASE_FILE = D / 'base.json'
+BASE_RULES = D / 'rules' / 'base'
+BASE_RULE_URLS = {
+    'cn': 'https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs',
+    'gfw': 'https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/gfw.srs',
+    'geoip-cn': 'https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs',
+}
+PANELS = [
+    {'id': 'official', 'name': 'SagerNet 官方面板'},
+    {'id': 'yacd', 'name': 'Yacd（第三方）'},
+    {'id': 'custom', 'name': '自定义地址'},
+]
+
+
+def save(path, data):
+    tmp = path.with_suffix('.tmp')
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+
+
+def fetch(url):
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != 'https' or not parsed.hostname:
+        raise ValueError('需要 HTTPS 链接')
+    for extra in (['--proxy', 'http://127.0.0.1:18081'], ['--noproxy', '*']):
+        r = sp.run(['curl', '-4fsSL', *extra, '--proto', '=https', '--proto-redir', '=https',
+                    '--connect-timeout', '5', '--max-time', '40', '--max-filesize', '33554432',
+                    '-A', 'SFA (sing-box 1.15.0-alpha.13)', url], capture_output=True)
+        if r.returncode == 0:
+            return r.stdout
+    raise ValueError('下载失败：' + parsed.hostname)
+
+
+def validate(name):
+    if not re.fullmatch(r'[\w.-]{1,64}', name) or name.startswith('.'):
+        raise ValueError('配置名称无效')
+
+
+def check(cfg):
+    p = D / 'candidate.json'
+    save(p, json.dumps(cfg, ensure_ascii=False).encode())
+    r = sp.run([str(D / 'core'), 'check', '-D', str(D), '-c', str(p)], capture_output=True)
+    if r.returncode:
+        raise ValueError('sing-box 校验失败 ' + r.stderr.decode(errors='replace')[-260:])
+    return p
+
+
+def render(src):
+    cfg = json.loads(src)
+    cfg['inbounds'] = [dict(type='socks', tag='lan-forward', listen='127.0.0.1', listen_port=18082),
+                       dict(type='direct', tag='router-dns', listen='127.0.0.1', listen_port=15353)]
+    route = cfg.setdefault('route', {})
+    route['auto_detect_interface'] = True
+    route['default_mark'] = 0x2024
+    route.setdefault('rules', []).insert(0, {'inbound': 'router-dns', 'action': 'hijack-dns'})
+    dns = cfg.setdefault('dns', {})
+    dns.setdefault('rules', [])
+    dns.setdefault('servers', [])
+    legacy_path = D / 'before-cutover' / 'original-sing-box.json'
+    if not legacy_path.exists():
+        legacy_path = D / 'ingress-extra.json'
+    legacy = json.loads(legacy_path.read_bytes()) if legacy_path.exists() else {
+        'inbounds': [dict(type='http',tag='local-http',listen='127.0.0.1',listen_port=18081)],
+        'outbounds': [dict(type='direct',tag='ingress-direct')],
+        'route': {'final':'ingress-direct'},
+        'dns': {'servers':[dict(type='udp',tag='bootstrap-local',server='223.5.5.5')]}}
+    tags = [x['tag'] for x in legacy['inbounds']]
+    old_final = legacy['route']['final']
+    if any(x.get('tag') in tags for x in cfg['inbounds']) or any(x.get('tag') == old_final for x in cfg['outbounds']):
+        raise ValueError('旧服务标签冲突')
+    for inbound in legacy['inbounds']:
+        tls = inbound.get('tls', {})
+        if 'acme' in tls:
+            tls['certificate_provider'] = {'type': 'acme', **tls.pop('acme')}
+    cfg['inbounds'].extend(legacy['inbounds'])
+    cfg['outbounds'].extend(legacy['outbounds'])
+    cfg['dns']['servers'].extend(legacy['dns']['servers'])
+    route.setdefault('default_domain_resolver', cfg['dns']['servers'][0]['tag'])
+    for rs in route.get('rule_set', []):
+        if rs.get('type') != 'remote':
+            continue
+        raw = fetch(rs['url'])
+        if rs.get('format') == 'source':
+            json.loads(raw)
+        directory = D / 'rules'
+        directory.mkdir(exist_ok=True)
+        target = directory / (hashlib.sha256(raw).hexdigest() + ('.srs' if rs.get('format') == 'binary' else '.json'))
+        if not target.exists():
+            save(target, raw)
+        tag, fmt = rs['tag'], rs.get('format', 'binary')
+        rs.clear()
+        rs.update(type='local', tag=tag, format=fmt, path=str(target))
+    for x in cfg.get('outbounds', []):
+        if x.get('tag') == 'PROXY' and x['type'] == 'selector':
+            x['interrupt_exist_connections'] = True
+
+    token = D / 'token'
+    if not token.exists():
+        save(token, secrets.token_urlsafe(32).encode())
+    ex = cfg.setdefault('experimental', {})
+    ex['cache_file'] = {'enabled': True, 'path': str(D / 'cache.db')}
+    ex['clash_api'] = {'external_controller': LAN + ':9090', 'external_ui': str(D / 'ui'),
+                       'secret': token.read_text(), 'access_control_allow_origin': ['http://' + LAN + ':9090', 'http://' + LAN + ':9091', 'http://' + LAN + ':9092', 'http://' + LAN + ':9093', 'http://' + LAN + ':9094']}
+    cfg['services'] = [s for s in cfg.get('services', []) if s.get('tag') != 'router-dashboard']
+    cfg['services'].append(dict(type='api', tag='router-dashboard', listen=LAN, listen_port=9091,
+                                secret=token.read_text(),
+                                access_control_allow_origin=['http://' + LAN + ':9090', 'http://' + LAN + ':9091', 'http://' + LAN + ':9092', 'http://' + LAN + ':9093', 'http://' + LAN + ':9094'], dashboard=str(D / 'ui')))
+    cfg['dns']['rules'].insert(0, dict(query_type=['AAAA'], action='predefined', rcode='NOERROR'))
+    settings = json.loads((D/'system.json').read_text()) if (D/'system.json').exists() else {}
+    domains = settings.get('ipv6_direct_domains',[])
+    if domains and any(x.get('tag')=='daed-dns' for x in cfg['dns']['servers']):
+        cfg['dns']['rules'].insert(0, dict(domain_suffix=domains, query_type=['AAAA'], action='route', server='daed-dns'))
+    return check(cfg)
+
+
+def healthy():
+    for _ in range(20):
+        r = sp.run(['curl', '-fsS', '--max-time', '2', '-H', 'Authorization: Bearer ' + (D / 'token').read_text(),
+                    api_url('/version')], capture_output=True)
+        if r.returncode == 0:
+            return True
+        time.sleep(1)
+    return False
+
+
+def base_mode():
+    if BASE_FILE.exists():
+        try:
+            mode = json.loads(BASE_FILE.read_text()).get('mode', 'mainland')
+            return mode if mode in ('mainland', 'gfw') else 'mainland'
+        except Exception:
+            pass
+    return 'mainland'
+
+
+def set_base_mode(mode):
+    if mode not in ('mainland', 'gfw'):
+        raise ValueError('分流方式无效')
+    old = BASE_FILE.read_bytes() if BASE_FILE.exists() else None
+    save(BASE_FILE, json.dumps({'mode': mode}, ensure_ascii=False).encode())
+    try:
+        if active_name() == 'base':
+            install('base', True)
+    except Exception:
+        if old is None:
+            BASE_FILE.unlink(missing_ok=True)
+        else:
+            save(BASE_FILE, old)
+        raise
+    return {'ok': True, 'mode': mode}
+
+
+def base_rule(name):
+    BASE_RULES.mkdir(parents=True, exist_ok=True)
+    target = BASE_RULES / (name + '.srs')
+    if target.exists() and target.stat().st_size > 0:
+        return str(target)
+    url = BASE_RULE_URLS[name]
+    raw = None
+    for candidate in (url, 'https://gh-proxy.com/' + url):
+        try:
+            raw = fetch(candidate)
+            break
+        except Exception:
+            continue
+    if not raw or len(raw) < 100:
+        raise ValueError('规则集下载失败：' + name)
+    save(target, raw)
+    return str(target)
+
+
+def base_config(nodes, mode='mainland'):
+    if not nodes:
+        raise ValueError('基础配置还没有节点，请先添加或从订阅导入节点')
+    gfw = mode == 'gfw'
+    tags = [n['tag'] for n in nodes]
+    sets = [dict(type='local', tag='gfw', format='binary', path=base_rule('gfw'))] if gfw else [
+        dict(type='local', tag='cn', format='binary', path=base_rule('cn')),
+        dict(type='local', tag='geoip-cn', format='binary', path=base_rule('geoip-cn'))]
+    rules = [{'action': 'sniff'}, {'protocol': 'dns', 'action': 'hijack-dns'},
+             {'ip_is_private': True, 'action': 'route', 'outbound': 'DIRECT'}]
+    if gfw:
+        rules.append({'rule_set': 'gfw', 'action': 'route', 'outbound': 'PROXY'})
+    else:
+        rules.append({'rule_set': 'cn', 'action': 'route', 'outbound': 'DIRECT'})
+        rules.append({'action': 'resolve'})
+        rules.append({'rule_set': 'geoip-cn', 'action': 'route', 'outbound': 'DIRECT'})
+    dns_rules = ([{'rule_set': 'gfw', 'server': 'dns-remote'}] if gfw
+                 else [{'rule_set': 'cn', 'server': 'dns-local'}])
+    cfg = {
+        'outbounds': [
+            dict(type='selector', tag='PROXY', outbounds=['AUTO'] + tags, default='AUTO',
+                 interrupt_exist_connections=True),
+            dict(type='urltest', tag='AUTO', outbounds=tags, url='https://www.gstatic.com/generate_204',
+                 interval='1m', tolerance=50),
+        ] + [json.loads(json.dumps(n)) for n in nodes] + [dict(type='direct', tag='DIRECT'),
+                                                         dict(type='block', tag='REJECT')],
+        'dns': {
+            'servers': [dict(type='udp', tag='dns-local', server='223.5.5.5'),
+                        dict(type='https', tag='dns-remote', server='1.1.1.1', path='/dns-query', detour='PROXY')],
+            'rules': dns_rules,
+            'final': 'dns-local' if gfw else 'dns-remote',
+        },
+        'route': {
+            'rules': rules,
+            'rule_set': sets,
+            'final': 'DIRECT' if gfw else 'PROXY',
+            'auto_detect_interface': False,
+            'default_domain_resolver': 'dns-local',
+        },
+    }
+    return cfg
+
+
+def node_objects(cfg):
+    out = []
+    for x in cfg.get('outbounds', []):
+        if x.get('type') in PROXY_TYPES and x.get('tag') not in NON_NODE_TAGS:
+            out.append(json.loads(json.dumps(x)))
+    return out
+
+
+def base_all_nodes(obj):
+    items = []
+    for n in obj.get('nodes') or []:
+        items.append((n, ''))
+    for sub in obj.get('subs') or []:
+        for n in sub.get('nodes') or []:
+            items.append((n, sub.get('name') or '订阅'))
+    seen = set()
+    out = []
+    for n, source in items:
+        node = json.loads(json.dumps(n))
+        base = node.get('tag') or node.get('server') or 'node'
+        tag = base
+        i = 2
+        while tag in seen:
+            tag = f'{base}-{i}'
+            i += 1
+        node['tag'] = tag
+        seen.add(tag)
+        out.append((node, source))
+    return out
+
+
+def base_sub_add(name, url):
+    name = (name or '').strip() or urllib.parse.urlsplit(url).hostname or 'subscription'
+    if not re.fullmatch(r'[\w.-]{1,64}', name):
+        raise ValueError('订阅名称无效')
+    nodes = sub_parse(fetch(url).decode('utf-8', 'replace'))
+    if not nodes:
+        raise ValueError('订阅里没有可用节点')
+    path = profiles / 'base.json'
+    ensure_base()
+    obj = json.loads(path.read_bytes())
+    subs = obj.setdefault('subs', [])
+    subs[:] = [x for x in subs if x.get('name') != name]
+    subs.append({'name': name, 'url': url, 'nodes': nodes})
+    obj['nodeCount'] = len(base_all_nodes(obj))
+    save(path, json.dumps(obj, ensure_ascii=False).encode())
+    selected = (D / 'selected').read_text().strip() if (D / 'selected').exists() else ''
+    if selected == 'base':
+        install('base', True)
+    return {'ok': True, 'nodes': len(nodes)}
+
+
+def base_sub_list():
+    ensure_base()
+    obj = json.loads((profiles / 'base.json').read_bytes())
+    return {'subs': [{'name': x.get('name', ''), 'url': x.get('url', ''),
+                      'nodes': len(x.get('nodes') or [])} for x in obj.get('subs') or []]}
+
+
+def base_sub_del(name):
+    obj = read_obj('base')
+    before = len(obj.get('subs') or [])
+    obj['subs'] = [x for x in obj.get('subs') or [] if x.get('name') != name]
+    if len(obj['subs']) == before:
+        raise ValueError('订阅不存在')
+    if base_all_nodes(obj):
+        write_profile('base', obj)
+    elif active_name() == 'base':
+        raise ValueError('正在使用的基础配置至少保留一个节点')
+    else:
+        obj['nodeCount'] = 0
+        save(profiles / 'base.json', json.dumps(obj, ensure_ascii=False).encode())
+    return {'ok': True}
+
+
+def base_sub_refresh(name=''):
+    path = profiles / 'base.json'
+    obj = json.loads(path.read_bytes())
+    subs = obj.get('subs') or []
+    changed = 0
+    for sub in subs:
+        if name and sub.get('name') != name:
+            continue
+        try:
+            nodes = sub_parse(fetch(sub['url']).decode('utf-8', 'replace'))
+        except Exception:
+            continue
+        if nodes:
+            sub['nodes'] = nodes
+            changed += 1
+    if changed:
+        obj['nodeCount'] = len(base_all_nodes(obj))
+        save(path, json.dumps(obj, ensure_ascii=False).encode())
+        selected = (D / 'selected').read_text().strip() if (D / 'selected').exists() else ''
+        if selected == 'base':
+            install('base', True)
+    return {'ok': True, 'updated': changed}
+
+
+def ensure_base():
+    path = profiles / 'base.json'
+    if path.exists():
+        return
+    nodes = []
+    try:
+        selected = (D / 'selected').read_text().strip() if (D / 'selected').exists() else ''
+        if selected and selected != 'base':
+            nodes = node_objects(profile_config(json.loads((profiles / (selected + '.json')).read_bytes())))
+    except Exception:
+        nodes = []
+    save(path, json.dumps({'base': True, 'nodes': nodes}, ensure_ascii=False).encode())
+
+
+def count_nodes(obj):
+    if 'base' in obj:
+        return len(base_all_nodes(obj))
+    if 'suburl' in obj:
+        return len(obj.get('nodes') or [])
+    if 'config' in obj:
+        return len(node_list(obj['config']))
+    return 0
+
+
+def refresh_counts():
+    for path in profiles.glob('*.json'):
+        try:
+            obj = json.loads(path.read_bytes())
+        except Exception:
+            continue
+        count = count_nodes(obj)
+        if 'url' in obj and count == 0:
+            try:
+                cfg = json.loads(json.dumps(obj['config'])) if obj.get('config') else json.loads(fetch(obj['url']))
+                count = len(node_list(cfg)) + len(obj.get('nodes') or [])
+            except Exception:
+                pass
+        obj['nodeCount'] = count
+        save(path, json.dumps(obj, ensure_ascii=False).encode())
+    return {'ok': True}
+
+
+def set_token(arg):
+    value = (arg.get('token') or '').strip() or secrets.token_urlsafe(32)
+    if len(value) < 16:
+        raise ValueError('密钥至少 16 个字符')
+    if not re.fullmatch(r'[A-Za-z0-9_=+/.-]+', value):
+        raise ValueError('密钥只能包含字母、数字和 _ = + / . -')
+    save(D / 'token', value.encode())
+    selected = (D / 'selected').read_text().strip() if (D / 'selected').exists() else ''
+    if selected:
+        install(selected, True)
+    return {'token': value}
+
+
+def add_nodes(cfg, nodes):
+    out = cfg['outbounds']
+    by_tag = {x.get('tag'): x for x in out}
+    selector = next((x for x in out if x.get('tag') == 'PROXY' and x['type'] == 'selector'), None)
+    if selector is None:
+        selector = next((x for x in out if x['type'] == 'selector'), None)
+    if selector is None:
+        raise ValueError('当前配置没有手动选择组，请选择新建基础配置')
+    groups = [selector] + [x for x in out if x['type'] == 'urltest' and x.get('tag') in selector['outbounds']]
+    for x in nodes:
+        tag = x.get('tag')
+        if not tag or x.get('type') not in PROXY_TYPES or not x.get('server'):
+            raise ValueError('节点格式无效')
+        if tag in by_tag and by_tag[tag] != x:
+            raise ValueError('节点名称冲突：' + tag)
+        if tag not in by_tag:
+            out.append(x)
+            by_tag[tag] = x
+        for g in groups:
+            if tag not in g['outbounds']:
+                g['outbounds'].append(tag)
+    return cfg
+
+
+def apply_node_edits(cfg, obj):
+    deleted = set(obj.get('nodeDels') or [])
+    overrides = obj.get('nodeOverrides') or {}
+    renames = {}
+    final = []
+    for original in cfg.get('outbounds', []):
+        old_tag = original.get('tag')
+        replacement = overrides.get(old_tag)
+        node = json.loads(json.dumps(replacement or original))
+        new_tag = node.get('tag')
+        renamed = replacement is not None and new_tag != old_tag
+        if original.get('type') in PROXY_TYPES:
+            if new_tag in deleted or (old_tag in deleted and not renamed):
+                continue
+            if renamed:
+                renames[old_tag] = new_tag
+        final.append(node)
+    for old_tag, node in overrides.items():
+        if not any(x.get('tag') == node.get('tag') for x in final) and old_tag not in deleted and node.get('tag') not in deleted:
+            final.append(json.loads(json.dumps(node)))
+    tags = {x.get('tag') for x in final}
+    for group in final:
+        if group.get('type') in ('selector', 'urltest'):
+            group['outbounds'] = list(dict.fromkeys(renames.get(t, t) for t in group.get('outbounds', [])
+                                                  if renames.get(t, t) in tags))
+            default = renames.get(group.get('default'), group.get('default'))
+            if default in group['outbounds']:
+                group['default'] = default
+            else:
+                group.pop('default', None)
+    cfg['outbounds'] = final
+    return cfg
+
+
+def profile_config(obj):
+    if 'base' in obj:
+        cfg = base_config([n for n, _ in base_all_nodes(obj)], base_mode())
+    elif 'suburl' in obj:
+        cfg = base_config(json.loads(json.dumps(obj.get('nodes', []))), base_mode())
+    elif 'url' in obj:
+        cfg = json.loads(json.dumps(obj['config'])) if obj.get('config') else json.loads(fetch(obj['url']))
+        if obj.get('nodes'):
+            add_nodes(cfg, obj['nodes'])
+    else:
+        cfg = json.loads(json.dumps(obj['config']))
+        if obj.get('nodes'):
+            add_nodes(cfg, obj['nodes'])
+    return apply_node_edits(cfg, obj)
+
+
+def node_list(cfg):
+    result = []
+    for x in cfg.get('outbounds', []):
+        tag = x.get('tag')
+        if x.get('type') in PROXY_TYPES and tag not in NON_NODE_TAGS:
+            result.append({'tag': tag, 'type': x.get('type'), 'server': x.get('server', ''),
+                           'port': x.get('server_port', 0)})
+    return result
+
+
+def b64decode_text(text):
+    text = text.strip().replace('-', '+').replace('_', '/')
+    text += '=' * (-len(text) % 4)
+    try:
+        return base64.b64decode(text).decode('utf-8', 'replace')
+    except Exception:
+        return ''
+
+
+def parse_link(uri):
+    if uri.startswith('vmess://'):
+        raw = b64decode_text(uri[8:])
+        o = json.loads(raw)
+        tag = str(o.get('ps') or o.get('add'))
+        out = {'type': 'vmess', 'tag': tag, 'server': o['add'], 'server_port': int(o['port']),
+               'uuid': o['id'], 'alter_id': int(o.get('aid') or 0), 'security': o.get('scy') or 'auto'}
+        if o.get('tls') in ('tls', 'reality'):
+            out['tls'] = {'enabled': True, 'server_name': o.get('sni') or o.get('host') or o['add']}
+        net = o.get('net') or 'tcp'
+        if net == 'ws':
+            out['transport'] = {'type': 'ws', 'path': o.get('path') or '/',
+                                'headers': {'Host': o.get('host') or o['add']}}
+        elif net == 'grpc':
+            out['transport'] = {'type': 'grpc', 'service_name': o.get('path') or ''}
+        return out
+    if uri.startswith('ss://'):
+        body = uri[5:]
+        tag = ''
+        if '#' in body:
+            body, frag = body.split('#', 1)
+            tag = urllib.parse.unquote(frag)
+        body = body.split('?')[0]
+        if '@' in body:
+            user, hostpart = body.rsplit('@', 1)
+            cred = b64decode_text(user) if ':' not in urllib.parse.unquote(user) else urllib.parse.unquote(user)
+            host, port = hostpart.rsplit(':', 1)
+        else:
+            raw = b64decode_text(body)
+            cred, hostpart = raw.rsplit('@', 1)
+            host, port = hostpart.rsplit(':', 1)
+        method, password = cred.split(':', 1)
+        return {'type': 'shadowsocks', 'tag': tag or host, 'server': host, 'server_port': int(port),
+                'method': method, 'password': password}
+    if '://' not in uri:
+        return None
+    scheme, rest = uri.split('://', 1)
+    if '#' in rest:
+        rest, frag = rest.split('#', 1)
+        tag = urllib.parse.unquote(frag)
+    else:
+        tag = ''
+    if '?' in rest:
+        body, query = rest.split('?', 1)
+        q = urllib.parse.parse_qs(query)
+    else:
+        body, q = rest, {}
+    userinfo, hostpart = (body.rsplit('@', 1) + [''])[:2] if '@' in body else ('', body)
+    host, _, port = hostpart.rpartition(':')
+    if not host:
+        return None
+    port = int(port)
+    q1 = lambda k, d='': (q.get(k) or [d])[0]
+    if scheme == 'vless':
+        out = {'type': 'vless', 'tag': tag or host, 'server': host, 'server_port': port,
+               'uuid': urllib.parse.unquote(userinfo)}
+        security = q1('security')
+        if security in ('tls', 'reality'):
+            tls = {'enabled': True, 'server_name': q1('sni') or q1('host') or host}
+            if q1('fp'):
+                tls['utls'] = {'enabled': True, 'fingerprint': q1('fp')}
+            if security == 'reality':
+                tls['reality'] = {'enabled': True, 'public_key': q1('pbk')}
+                if q1('sid'):
+                    tls['reality']['short_id'] = q1('sid')
+            out['tls'] = tls
+        if q1('flow'):
+            out['flow'] = q1('flow')
+        transport = q1('type')
+        if transport == 'ws':
+            out['transport'] = {'type': 'ws', 'path': urllib.parse.unquote(q1('path', '/')),
+                                'headers': {'Host': q1('host') or host}}
+        elif transport == 'grpc':
+            out['transport'] = {'type': 'grpc', 'service_name': q1('serviceName')}
+        return out
+    if scheme == 'trojan':
+        out = {'type': 'trojan', 'tag': tag or host, 'server': host, 'server_port': port,
+               'password': urllib.parse.unquote(userinfo)}
+        sni = q1('sni') or q1('peer') or host
+        out['tls'] = {'enabled': True, 'server_name': sni}
+        if q1('allowInsecure') in ('1', 'true'):
+            out['tls']['insecure'] = True
+        if q1('type') == 'ws':
+            out['transport'] = {'type': 'ws', 'path': urllib.parse.unquote(q1('path', '/')),
+                                'headers': {'Host': q1('host') or sni}}
+        return out
+    if scheme in ('hysteria2', 'hy2'):
+        out = {'type': 'hysteria2', 'tag': tag or host, 'server': host, 'server_port': port,
+               'password': urllib.parse.unquote(userinfo)}
+        out['tls'] = {'enabled': True, 'server_name': q1('sni') or host}
+        if q1('insecure') in ('1', 'true'):
+            out['tls']['insecure'] = True
+        if q1('obfs'):
+            out['obfs'] = {'type': q1('obfs'), 'password': q1('obfs-password')}
+        if q1('alpn'):
+            out['tls']['alpn'] = [x for x in q1('alpn').split(',') if x]
+        return out
+    if scheme == 'tuic':
+        out = {'type': 'tuic', 'tag': tag or host, 'server': host, 'server_port': port,
+               'uuid': urllib.parse.unquote(userinfo), 'password': q1('password')}
+        out['tls'] = {'enabled': True, 'server_name': q1('sni') or host}
+        return out
+    return None
+
+
+def sub_parse(text):
+    raw = text.strip()
+    nodes = []
+    if raw.startswith('{') or raw.startswith('['):
+        cfg = json.loads(raw)
+        for x in (cfg.get('outbounds') or []):
+            if x.get('type') in PROXY_TYPES and x.get('server'):
+                node = json.loads(json.dumps(x))
+                node.setdefault('tag', node['server'])
+                nodes.append(node)
+        return nodes
+    if '://' not in raw:
+        raw = b64decode_text(raw)
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        try:
+            node = parse_link(line)
+        except Exception:
+            node = None
+        if node and node.get('server'):
+            nodes.append(node)
+    tags = {}
+    for n in nodes:
+        base = n['tag']
+        i = 2
+        while n['tag'] in tags:
+            n['tag'] = f'{base}-{i}'
+            i += 1
+        tags[n['tag']] = True
+    return nodes
+
+
+def profile_action(method, arg, name):
+    path = profiles / (name + '.json')
+    original = path.read_bytes() if path.exists() else None
+    revision = hashlib.sha256(original or b'').hexdigest()
+    if method == 'readprofile':
+        if not original:
+            raise ValueError('配置不存在')
+        obj = json.loads(original)
+        return dict(value=json.dumps(profile_config(obj), ensure_ascii=False, indent=2), revision=revision,
+                    remote='url' in obj, url=obj.get('url',''))
+    if method == 'editprofile':
+        dest = arg['dest']
+        validate(dest)
+        if not original or revision != arg['revision']:
+            raise ValueError('配置已改变，请重新打开编辑器')
+        target = profiles / (dest + '.json')
+        source_edit=arg.get('source',False)
+        if source_edit:
+            obj=json.loads(original)
+            if 'url' not in obj:
+                raise ValueError('只有链接配置可以修改来源链接')
+            if target != path and target.exists():
+                raise ValueError('目标名称已存在')
+            url=arg.get('url','').strip()
+            cfg=json.loads(fetch(url))
+            if not isinstance(cfg,dict) or not isinstance(cfg.get('outbounds'),list):
+                raise ValueError('该链接不是完整 sing-box 配置，请从导入入口添加节点')
+            obj['url']=url
+            obj['config']=cfg
+            render(json.dumps(profile_config(obj)).encode())
+            obj['nodeCount']=len(node_objects(profile_config(obj)))
+            save(target,json.dumps(obj,ensure_ascii=False).encode())
+            try:
+                if dest==active_name():install(dest,True)
+            except Exception:
+                if target==path:save(path,original)
+                else:target.unlink(missing_ok=True)
+                raise
+            return {'ok':True}
+        if target == path and ('url' in json.loads(original) or 'suburl' in json.loads(original)):
+            raise ValueError('订阅请另存为本地副本')
+        if target != path and target.exists():
+            raise ValueError('目标名称已存在')
+        obj = {'config': json.loads(arg['value'])}
+    elif method == 'nodes':
+        nodes = json.loads(arg['value'])
+        if not isinstance(nodes, list) or not nodes:
+            raise ValueError('没有节点')
+        target = path
+        if arg['new']:
+            if original:
+                raise ValueError('名称已存在')
+            obj = {'config': base_config(nodes)}
+        else:
+            if not original:
+                raise ValueError('配置不存在')
+            obj = json.loads(original)
+            if 'url' in obj or 'suburl' in obj or 'base' in obj:
+                extra = obj.setdefault('nodes', [])
+                extra.extend(x for x in nodes if x not in extra)
+            else:
+                add_nodes(obj['config'], nodes)
+    else:
+        raise ValueError('未知配置操作')
+    cfg = profile_config(obj)
+    if not isinstance(cfg.get('outbounds'), list) or not cfg['outbounds']:
+        raise ValueError('配置缺少 outbounds')
+    render(json.dumps(cfg).encode())
+    save(target, json.dumps(obj, ensure_ascii=False).encode())
+    return {'ok': True}
+
+
+def install(name, activate):
+    obj = json.loads((profiles / (name + '.json')).read_bytes())
+    candidate = render(json.dumps(profile_config(obj)).encode())
+    if not activate:
+        return
+    active = D / 'active.json'
+    old = active.read_bytes() if active.exists() else None
+    if old and json.loads(old) == json.loads(candidate.read_bytes()) and healthy():
+        candidate.unlink()
+        save(D / 'selected', name.encode())
+        return
+    os.replace(candidate, active)
+    try:
+        sp.run(['/etc/init.d/sb-ingress', 'restart'], check=True)
+        if not healthy():
+            raise RuntimeError('服务健康检查失败')
+        for url in ['https://www.baidu.com', 'https://www.gstatic.com/generate_204']:
+            sp.run(['curl', '--proxy', 'http://127.0.0.1:18081', '-fsSL', '--retry', '3', '--retry-connrefused',
+                    '--retry-delay', '1', '--max-time', '12', '-o', '/dev/null', url], check=True, stderr=sp.DEVNULL)
+    except Exception:
+        if old:
+            save(active, old)
+            sp.run(['/etc/init.d/sb-ingress', 'restart'])
+        raise
+    save(D / 'selected', name.encode())
+
+
+INIT = '/etc/init.d/sb-router'
+CRONS = {'nodes': '/etc/sb-router/manage cli refresh-nodes', 'config': '/etc/sb-router/manage cli refresh-config'}
+CRON_LOGS = {'nodes': '/tmp/sb-router-nodes.log', 'config': '/tmp/sb-router-config.log'}
+CRONS['unified'] = '/etc/sb-router/manage cli refresh-selected'
+CRON_LOGS['unified'] = '/tmp/sb-router-selected-update.log'
+
+
+def schedule(kind):
+    cmd = CRONS[kind].split()
+    for line in pathlib.Path('/etc/crontabs/root').read_text().splitlines():
+        fields = line.split()
+        if len(fields) < 8 or fields[5:8] != cmd:
+            continue
+        if not (fields[0].isdigit() and fields[1].isdigit()):
+            continue
+        minute, hour, dom, mon, dow = fields[:5]
+        base = {'enabled': True, 'hour': int(hour), 'minute': int(minute), 'weekday': 1, 'day': 1}
+        if dow != '*' and dow.isdigit():
+            return dict(base, mode='weekly', weekday=int(dow))
+        if dom != '*' and dom.isdigit():
+            return dict(base, mode='monthly', day=int(dom))
+        return dict(base, mode='daily')
+    return {'enabled': False, 'mode': 'daily', 'weekday': 1, 'day': 1, 'hour': 2, 'minute': 0}
+
+
+def set_schedule(kind, arg):
+    if kind not in CRONS:
+        raise ValueError('更新类型无效')
+    h = int(arg['hour'])
+    m = int(arg['minute'])
+    if not 0 <= h < 24 or not 0 <= m < 60:
+        raise ValueError('时间无效')
+    mode = arg.get('mode', 'daily')
+    if mode not in ('daily', 'weekly', 'monthly'):
+        raise ValueError('更新周期无效')
+    weekday = int(arg.get('weekday', 1))
+    day = int(arg.get('day', 1))
+    if mode == 'weekly' and not 0 <= weekday <= 6:
+        raise ValueError('星期无效')
+    if mode == 'monthly' and not 1 <= day <= 31:
+        raise ValueError('日期无效')
+    if mode == 'weekly':
+        expr = f'{m} {h} * * {weekday}'
+    elif mode == 'monthly':
+        expr = f'{m} {h} {day} * *'
+    else:
+        expr = f'{m} {h} * * *'
+    path = pathlib.Path('/etc/crontabs/root')
+    cmd = CRONS[kind].split()
+    lines = [line for line in path.read_text().splitlines() if line.split()[5:8] != cmd]
+    if arg['enabled']:
+        lines.append(f'{expr} {CRONS[kind]} >{CRON_LOGS[kind]} 2>&1')
+    payload = ('\n'.join(lines) + '\n').encode()
+    sp.run(['crontab', '-'], input=payload, check=True)
+    return {'ok': True}
+
+
+def control(start):
+    running = pathlib.Path('/sys/class/net/sb-zh').exists()
+    if start and running:
+        return {'ok': True, 'message': '已在运行'}
+    if (not start) and (not running):
+        return {'ok': True, 'message': '已停止'}
+    if start:
+        sp.run([INIT, 'start'], check=True)
+        if not healthy() or not pathlib.Path('/sys/class/net/sb-zh').exists():
+            raise RuntimeError('启动失败，请检查服务日志')
+    else:
+        sp.run([INIT, 'stop'], check=True)
+        if pathlib.Path('/sys/class/net/sb-zh').exists():
+            raise RuntimeError('服务仍在运行')
+    return {'ok': True}
+
+
+def core_pid():
+    for proc in pathlib.Path('/proc').glob('[0-9]*'):
+        try:
+            cmd = (proc / 'cmdline').read_bytes()
+        except OSError:
+            continue
+        if b'/etc/sb-router/core' in cmd and b'active.json' in cmd:
+            return int(proc.name)
+    return 0
+
+
+def uptime_seconds():
+    pid = core_pid()
+    if not pid:
+        return 0
+    try:
+        ticks = int(pathlib.Path(f'/proc/{pid}/stat').read_text().split()[21])
+        hz = os.sysconf('SC_CLK_TCK')
+        system_uptime = float(pathlib.Path('/proc/uptime').read_text().split()[0])
+        return max(0, int(system_uptime - ticks / hz))
+    except Exception:
+        return 0
+
+
+def kernel_version():
+    try:
+        out = sp.check_output([str(D / 'core'), 'version'], text=True, stderr=sp.DEVNULL)
+        return out.splitlines()[0].replace('sing-box version ', '').strip()
+    except Exception:
+        return '未安装'
+
+
+def clash_get(path):
+    r = sp.run(['curl', '-fsS', '--max-time', '6', '-H', 'Authorization: Bearer ' + (D / 'token').read_text(),
+                'http://' + LAN + ':9090' + path], capture_output=True)
+    if r.returncode:
+        raise ValueError('内核接口不可用')
+    return json.loads(r.stdout)
+
+
+def node_delays(name):
+    obj = json.loads((profiles / (name + '.json')).read_bytes())
+    nodes = node_list(profile_config(obj))
+    out = {}
+    for n in nodes[:40]:
+        tag = urllib.parse.quote(n['tag'], safe='')
+        try:
+            d = clash_get('/proxies/' + tag + '/delay?timeout=3000&url=' + urllib.parse.quote('https://www.gstatic.com/generate_204', safe=''))
+            out[n['tag']] = int(d.get('delay') or 0)
+        except Exception:
+            out[n['tag']] = -1
+    return {'delays': out}
+
+
+def node_get(name, tag):
+    obj = json.loads((profiles / (name + '.json')).read_bytes())
+    cfg = profile_config(obj)
+    for x in cfg['outbounds']:
+        if x.get('tag') == tag:
+            return {'value': json.dumps(x, ensure_ascii=False, indent=2)}
+    raise ValueError('节点不存在')
+
+
+def node_set(name, tag, value):
+    path = profiles / (name + '.json')
+    original = json.loads(path.read_bytes())
+    cfg = profile_config(original)
+    node = json.loads(value)
+    if node.get('type') not in PROXY_TYPES or not node.get('server'):
+        raise ValueError('节点格式无效')
+    new_tag = node.get('tag') or tag
+    idx = next((i for i, x in enumerate(cfg['outbounds']) if x.get('tag') == tag), -1)
+    if idx < 0:
+        raise ValueError('节点不存在')
+    cfg['outbounds'][idx] = node
+    if new_tag != tag:
+        for x in cfg['outbounds']:
+            if x.get('type') in ('selector', 'urltest'):
+                x['outbounds'] = [new_tag if t == tag else t for t in x.get('outbounds', [])]
+                if x.get('default') == tag:
+                    x['default'] = new_tag
+    render(json.dumps(cfg).encode())
+    target = path
+    if 'url' in original or 'suburl' in original or 'base' in original:
+        original.setdefault('nodeOverrides', {})[tag] = node
+        if new_tag != tag:
+            dels = original.setdefault('nodeDels', [])
+            if tag not in dels:
+                dels.append(tag)
+    else:
+        original['config'] = cfg
+    save(target, json.dumps(original, ensure_ascii=False).encode())
+    return {'ok': True}
+
+
+def node_del(name, tag):
+    path = profiles / (name + '.json')
+    original = json.loads(path.read_bytes())
+    cfg = profile_config(original)
+    if not any(x.get('tag') == tag and x.get('type') in PROXY_TYPES for x in cfg['outbounds']):
+        raise ValueError('节点不存在')
+    cfg['outbounds'] = [x for x in cfg['outbounds'] if x.get('tag') != tag]
+    for x in cfg['outbounds']:
+        if x.get('type') in ('selector', 'urltest'):
+            x['outbounds'] = [t for t in x.get('outbounds', []) if t != tag]
+            if x.get('default') == tag:
+                x['default'] = x['outbounds'][0] if x['outbounds'] else ''
+    render(json.dumps(cfg).encode())
+    if 'url' in original or 'suburl' in original or 'base' in original:
+        dels = original.setdefault('nodeDels', [])
+        if tag not in dels:
+            dels.append(tag)
+        original.get('nodeOverrides', {}).pop(tag, None)
+    else:
+        original['config'] = cfg
+    save(path, json.dumps(original, ensure_ascii=False).encode())
+    return {'ok': True}
+
+
+def sublink(name, url, new):
+    validate(name)
+    raw = fetch(url)
+    nodes = sub_parse(raw.decode('utf-8', 'replace'))
+    if not nodes:
+        raise ValueError('订阅里没有可用节点')
+    path = profiles / (name + '.json')
+    if new:
+        if path.exists():
+            raise ValueError('名称已存在')
+        obj = {'suburl': url, 'nodes': nodes}
+    else:
+        if not path.exists():
+            raise ValueError('配置不存在')
+        obj = json.loads(path.read_bytes())
+        obj['suburl'] = url
+        existing = {x.get('tag'): x for x in obj.get('nodes', [])}
+        for n in nodes:
+            existing[n['tag']] = n
+        obj['nodes'] = list(existing.values())
+    cfg = profile_config(obj)
+    render(json.dumps(cfg).encode())
+    save(path, json.dumps(obj, ensure_ascii=False).encode())
+    return {'ok': True, 'nodes': len(nodes)}
+
+
+def refresh_nodes():
+    for path in profiles.glob('*.json'):
+        obj = json.loads(path.read_bytes())
+        if 'suburl' not in obj:
+            continue
+        try:
+            nodes = sub_parse(fetch(obj['suburl']).decode('utf-8', 'replace'))
+        except Exception:
+            continue
+        if not nodes:
+            continue
+        obj['nodes'] = nodes
+        save(path, json.dumps(obj, ensure_ascii=False).encode())
+    try:
+        base_sub_refresh()
+    except Exception:
+        pass
+    selected = (D / 'selected').read_text().strip() if (D / 'selected').exists() else ''
+    if selected and 'suburl' in json.loads((profiles / (selected + '.json')).read_bytes()):
+        install(selected, True)
+
+
+def refresh_config():
+    for path in profiles.glob('*.json'):
+        obj = json.loads(path.read_bytes())
+        if 'url' not in obj:
+            continue
+        try:
+            cfg = json.loads(json.dumps(obj['config'])) if obj.get('config') else json.loads(fetch(obj['url']))
+        except Exception:
+            continue
+        if not isinstance(cfg.get('outbounds'), list):
+            continue
+        obj['config'] = cfg
+        save(path, json.dumps(obj, ensure_ascii=False).encode())
+    selected = (D / 'selected').read_text().strip() if (D / 'selected').exists() else ''
+    if selected and 'url' in json.loads((profiles / (selected + '.json')).read_bytes()):
+        install(selected, True)
+
+
+def profiles_info():
+    active = (D / 'selected').read_text().strip() if (D / 'selected').exists() else ''
+    out = []
+    for path in sorted(profiles.glob('*.json')):
+        try:
+            obj = json.loads(path.read_bytes())
+            kind = 'base' if 'base' in obj else ('subscription' if 'suburl' in obj else ('remote' if 'url' in obj else 'local'))
+            count = obj.get('nodeCount')
+            if count is None:
+                count = count_nodes(obj)
+            out.append({'name': path.stem, 'kind': kind, 'url': obj.get('suburl') or obj.get('url') or '',
+                        'nodes': count, 'active': path.stem == active})
+        except Exception:
+            out.append({'name': path.stem, 'kind': 'local', 'url': '', 'nodes': 0, 'active': path.stem == active})
+    return out
+
+
+def profile_delete(name):
+    validate(name)
+    if name == 'base':
+        raise ValueError('基础配置不能删除')
+    active = (D / 'selected').read_text().strip() if (D / 'selected').exists() else ''
+    if name == active:
+        raise ValueError('不能删除当前正在使用的配置，请先切换到其他配置')
+    path = profiles / (name + '.json')
+    if not path.exists():
+        raise ValueError('配置不存在')
+    path.unlink()
+    return {'ok': True}
+
+
+def panel_state():
+    path = D / 'panel.json'
+    data = {'id': 'official', 'url': ''}
+    if path.exists():
+        try:
+            data.update(json.loads(path.read_bytes()))
+        except Exception:
+            pass
+    known = {p['id'] for p in PANELS}
+    if data.get('id') not in known:
+        data['id'] = 'official'
+        data['url'] = ''
+    return {'id': data.get('id', 'official'), 'url': data.get('url', ''), 'panels': PANELS,
+            'link': panel_link(data.get('id', 'official'), data.get('url', ''))}
+
+
+def panel_set(arg):
+    pid = arg.get('id', 'official')
+    if pid not in {p['id'] for p in PANELS}:
+        raise ValueError('面板无效')
+    url = (arg.get('url') or '').strip()
+    link = panel_link(pid, url)
+    save(D / 'panel.json', json.dumps({'id': pid, 'url': url}, ensure_ascii=False).encode())
+    return {'ok': True, 'link': link, 'id': pid, 'url': url, 'panels': PANELS}
+
+
+def logs(arg):
+    limit = max(10, min(int(arg.get('lines', 300)), 2000))
+    r = sp.run(['logread', '-e', 'core'], capture_output=True, text=True)
+    lines = r.stdout.splitlines() if r.stdout else []
+    if not lines:
+        r = sp.run(['logread'], capture_output=True, text=True)
+        lines = r.stdout.splitlines()
+    return {'lines': lines[-limit:], 'total': len(lines)}
+
+
+def restart_service():
+    for init in ('/etc/init.d/sb-ingress', '/etc/init.d/sb-router'):
+        sp.run([init, 'restart'], check=True)
+    if not healthy():
+        raise RuntimeError('重启后健康检查未通过')
+    return {'ok': True}
+
+
+# Helpers for source-aware imports, node edits, and selected updates.
+import concurrent.futures
+import socket
+
+IMPORT_DIR = pathlib.Path('/tmp/sb-router-imports')
+UPDATE_FILE = D / 'update-selection.json'
+
+def read_obj(name):
+    validate(name)
+    path = profiles / (name + '.json')
+    if not path.exists():
+        raise ValueError('配置不存在')
+    return json.loads(path.read_bytes())
+
+def active_name():
+    return (D / 'selected').read_text().strip() if (D / 'selected').exists() else ''
+
+def write_profile(name, obj, apply_active=True):
+    path = profiles / (name + '.json')
+    old = path.read_bytes() if path.exists() else None
+    cfg = profile_config(obj)
+    render(json.dumps(cfg).encode())
+    obj['nodeCount'] = len(node_objects(cfg))
+    save(path, json.dumps(obj, ensure_ascii=False).encode())
+    try:
+        if apply_active and active_name() == name:
+            install(name, True)
+    except Exception:
+        if old is not None:
+            save(path, old)
+        else:
+            path.unlink(missing_ok=True)
+        raise
+
+def node_key(profile, source, original):
+    return hashlib.sha256(json.dumps([profile, source, original], ensure_ascii=False).encode()).hexdigest()[:24]
+
+def base_entries(obj):
+    entries = []
+    used = set()
+    sources = [('', obj.get('nodes') or [], {}, [])]
+    for sub in obj.get('subs') or []:
+        sources.append((sub['name'], sub.get('nodes') or [], sub.get('overrides') or {}, sub.get('deleted') or []))
+    for source, nodes, overrides, deleted in sources:
+        for index, original in enumerate(nodes):
+            original_tag = original.get('tag') or original.get('server') or ('node-' + str(index))
+            if original_tag in deleted:
+                continue
+            node = json.loads(json.dumps(overrides.get(original_tag, original)))
+            tag = node.get('tag') or original_tag
+            if tag in used:
+                suffix = hashlib.sha256((source + original_tag).encode()).hexdigest()[:6]
+                tag = tag + '-' + suffix
+            if tag in used:
+                raise ValueError('同一来源存在重复节点名称')
+            used.add(tag)
+            node['tag'] = tag
+            entries.append({'id': node_key('base', source, original_tag), 'owner': 'base',
+                            'source': source, 'original': original_tag, 'node': node})
+    return entries
+
+def base_all_nodes(obj):
+    return [(x['node'], x['source']) for x in base_entries(obj)]
+
+def catalog():
+    ensure_base()
+    entries = base_entries(read_obj('base'))
+    for p in sorted(profiles.glob('*.json')):
+        obj = json.loads(p.read_bytes())
+        if 'suburl' not in obj:
+            continue
+        cfg = profile_config(obj)
+        for node in node_objects(cfg):
+            entries.append({'id': node_key(p.stem, '', node['tag']), 'owner': p.stem,
+                            'source': p.stem, 'original': node['tag'], 'node': node})
+    return entries
+
+def catalog_public():
+    return {'nodes': [dict(id=x['id'], owner=x['owner'], source=x['source'],
+                           tag=x['node']['tag'], type=x['node']['type'],
+                           server=x['node']['server'], port=x['node']['server_port'])
+                      for x in catalog()],
+            'subscriptions': [dict(id='base:' + s['name'], name=s['name'], url=s['url'],
+                                   count=sum(x['source'] == s['name'] and x['owner'] == 'base' for x in catalog()))
+                              for s in read_obj('base').get('subs', [])]
+                             + [dict(id='profile:' + p['name'], name=p['name'], url=p['url'], count=p['nodes'])
+                                for p in profiles_info() if p['kind'] == 'subscription']}
+
+def find_entry(identity):
+    return next((x for x in catalog() if x['id'] == identity), None)
+
+def change_catalog(arg, delete=False):
+    entry = find_entry(arg['id'])
+    if not entry:
+        raise ValueError('节点已改变，请刷新列表')
+    if entry['owner'] != 'base':
+        return node_del(entry['owner'], entry['original']) if delete else node_set(entry['owner'], entry['original'], arg['value'])
+    obj = read_obj('base')
+    source = entry['source']
+    original = entry['original']
+    if not delete:
+        node = json.loads(arg['value'])
+        validate_node(node)
+    if source:
+        sub = next(x for x in obj['subs'] if x['name'] == source)
+        if delete:
+            sub.setdefault('deleted', []).append(original)
+            sub.get('overrides', {}).pop(original, None)
+        else:
+            sub.setdefault('overrides', {})[original] = node
+    else:
+        idx = next(i for i, n in enumerate(obj['nodes']) if (n.get('tag') or n.get('server')) == original)
+        if delete:
+            obj['nodes'].pop(idx)
+        else:
+            obj['nodes'][idx] = node
+    if base_all_nodes(obj):
+        write_profile('base', obj)
+    elif active_name() == 'base':
+        raise ValueError('正在使用的基础配置至少保留一个节点')
+    else:
+        obj['nodeCount'] = 0
+        save(profiles / 'base.json', json.dumps(obj, ensure_ascii=False).encode())
+    return {'ok': True}
+
+def validate_node(node):
+    if node.get('type') not in PROXY_TYPES or not isinstance(node.get('server'), str) or not node['server'].strip():
+        raise ValueError('节点协议或服务器地址无效')
+    if not isinstance(node.get('tag'), str) or not node['tag'].strip():
+        raise ValueError('请填写节点名称')
+    if not isinstance(node.get('server_port'), int) or not 1 <= node['server_port'] <= 65535:
+        raise ValueError('节点端口无效')
+    if node['type'] in ('vmess', 'vless', 'tuic') and not node.get('uuid'):
+        raise ValueError('请填写 UUID')
+    if node['type'] in ('trojan', 'hysteria2', 'shadowsocks') and not node.get('password'):
+        raise ValueError('请填写密码')
+    probe = {'outbounds': [node, {'type': 'direct', 'tag': '_validation-direct'}],
+             'dns': {'servers': [dict(type='udp', tag='local', server='223.5.5.5')]},
+             'route': {'final': '_validation-direct', 'default_domain_resolver': 'local'}}
+    check(probe)
+
+def clash_node(x):
+    typ = {'ss': 'shadowsocks', 'hy2': 'hysteria2'}.get(x.get('type'), x.get('type'))
+    if typ not in ('shadowsocks', 'vmess', 'vless', 'trojan', 'hysteria2', 'tuic', 'anytls'):
+        raise ValueError('不支持的 Clash 节点协议：' + str(x.get('type')))
+    n = dict(type=typ, tag=str(x.get('name') or x['server']), server=x['server'], server_port=int(x['port']))
+    for field in ('password', 'uuid', 'flow', 'username'):
+        if x.get(field) is not None:
+            n[field] = str(x[field])
+    if typ == 'shadowsocks':
+        n['method'] = x['cipher']
+        if x.get('plugin'):
+            raise ValueError('请将带插件的 Shadowsocks 节点转换为完整 sing-box 配置')
+    if typ == 'vmess':
+        n['security'] = x.get('cipher', 'auto')
+        n['alter_id'] = int(x.get('alterId', 0))
+    if x.get('tls') or typ in ('trojan', 'hysteria2', 'tuic', 'anytls'):
+        n['tls'] = {'enabled': True, 'server_name': x.get('servername') or x.get('sni') or x['server']}
+        if x.get('skip-cert-verify'):
+            n['tls']['insecure'] = True
+        if x.get('alpn'):
+            n['tls']['alpn'] = x['alpn']
+        if x.get('client-fingerprint'):
+            n['tls']['utls'] = {'enabled': True, 'fingerprint': x['client-fingerprint']}
+        if x.get('reality-opts'):
+            r = x['reality-opts']
+            n['tls']['reality'] = {'enabled': True, 'public_key': r['public-key'], 'short_id': r.get('short-id', '')}
+    network = x.get('network', 'tcp')
+    if network == 'ws':
+        opts = x.get('ws-opts', {})
+        n['transport'] = {'type': 'ws', 'path': opts.get('path', '/'), 'headers': opts.get('headers', {})}
+    elif network == 'grpc':
+        n['transport'] = {'type': 'grpc', 'service_name': x.get('grpc-opts', {}).get('grpc-service-name', '')}
+    elif network not in ('tcp', ''):
+        raise ValueError('暂不支持此 Clash 传输方式：' + network)
+    if typ == 'hysteria2' and x.get('obfs'):
+        n['obfs'] = {'type': x['obfs'], 'password': x.get('obfs-password', '')}
+    return n
+
+original_parse_link = parse_link
+def parse_link(uri):
+    parts = urllib.parse.urlsplit(uri)
+    scheme = parts.scheme.lower()
+    if scheme in ('vmess', 'ss'):
+        query = urllib.parse.parse_qs(parts.query)
+        if scheme == 'ss' and any(k in query for k in ('plugin', 'plugin-opts', 'plugin_opts')):
+            raise ValueError('此 Shadowsocks 分享链接使用插件，请导入完整配置')
+        node = original_parse_link(uri)
+        if node:
+            node['server'] = node['server'].strip('[]')
+        return node
+    if scheme not in ('vless', 'trojan', 'hy2', 'hysteria2', 'tuic', 'anytls'):
+        raise ValueError('不支持的节点分享协议')
+    query = urllib.parse.parse_qs(parts.query)
+    def param(key, default=''):
+        return (query.get(key) or [default])[0]
+    authority = parts.netloc
+    if '@' not in authority or not parts.hostname:
+        raise ValueError('节点链接缺少凭据或服务器')
+    credential = urllib.parse.unquote(authority.rsplit('@', 1)[0])
+    typ = 'hysteria2' if scheme == 'hy2' else scheme
+    node = dict(type=typ, tag=urllib.parse.unquote(parts.fragment) or parts.hostname,
+                server=parts.hostname, server_port=parts.port or (443 if typ in ('hysteria2', 'tuic') else 0))
+    if typ == 'vless':
+        node['uuid'] = credential
+        if param('flow'):
+            node['flow'] = param('flow')
+    elif typ == 'tuic':
+        uuid, separator, password = credential.partition(':')
+        node.update(uuid=uuid, password=password if separator else param('password'))
+    else:
+        node['password'] = credential
+    security = param('security', 'none' if typ == 'vless' else 'tls')
+    if security not in ('none', 'tls', 'reality', ''):
+        raise ValueError('不支持的 TLS 方式')
+    if security in ('tls', 'reality') or typ in ('trojan', 'hysteria2', 'tuic', 'anytls'):
+        tls = dict(enabled=True, server_name=param('sni') or param('peer') or parts.hostname)
+        if any(param(k).lower() in ('1', 'true') for k in ('insecure', 'allowInsecure')):
+            tls['insecure'] = True
+        if param('alpn'):
+            tls['alpn'] = param('alpn').split(',')
+        if param('fp'):
+            tls['utls'] = dict(enabled=True, fingerprint=param('fp'))
+        if security == 'reality':
+            tls['reality'] = dict(enabled=True, public_key=param('pbk'), short_id=param('sid'))
+        node['tls'] = tls
+    transport = param('type', 'tcp')
+    if transport in ('ws', 'httpupgrade'):
+        node['transport'] = dict(type=transport, path=param('path', '/'))
+        if param('host'):
+            if transport == 'httpupgrade':
+                node['transport']['host'] = param('host')
+            else:
+                node['transport']['headers'] = {'Host': param('host')}
+    elif transport == 'grpc':
+        node['transport'] = dict(type='grpc', service_name=param('serviceName'))
+    elif transport not in ('tcp', ''):
+        raise ValueError('不支持的传输方式')
+    if typ == 'hysteria2' and param('obfs'):
+        node['obfs'] = dict(type=param('obfs'), password=param('obfs-password'))
+    return node
+
+def sub_parse(text):
+    text = text.lstrip('﻿').strip()
+    if not text:
+        raise ValueError('导入内容为空')
+    if text.startswith(('{', '[')):
+        data = json.loads(text)
+        if isinstance(data, list):
+            nodes = data
+        elif isinstance(data.get('outbounds'), list):
+            nodes = node_objects(data)
+        elif isinstance(data.get('proxies'), list):
+            nodes = [clash_node(x) for x in data['proxies']]
+        elif data.get('type') in PROXY_TYPES:
+            nodes = [data]
+        else:
+            raise ValueError('JSON 中未找到代理节点')
+    elif re.search(r'(?m)^s*proxiess*:', text):
+        import yaml
+        data = yaml.safe_load(text)
+        nodes = [clash_node(x) for x in data.get('proxies') or []]
+    else:
+        decoded = text if '://' in text else b64decode_text(text)
+        nodes = []
+        for line in decoded.splitlines():
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            try:
+                n = parse_link(line)
+                if not n:
+                    raise ValueError('不支持的分享协议')
+                n['server'] = n['server'].strip('[]')
+                nodes.append(n)
+            except Exception:
+                raise ValueError('分享链接无法解析，请检查协议和参数')
+    if not nodes:
+        raise ValueError('内容中没有可导入的节点')
+    seen = set()
+    for n in nodes:
+        n.setdefault('tag', n.get('server', 'node'))
+        tag, i = n['tag'], 2
+        while n['tag'] in seen:
+            n['tag'] = tag + '-' + str(i)
+            i += 1
+        seen.add(n['tag'])
+    return nodes
+
+def inspect_import(arg):
+    IMPORT_DIR.mkdir(mode=0o700, exist_ok=True)
+    for p in IMPORT_DIR.glob('*.json'):
+        if time.time() - p.stat().st_mtime > 900:
+            p.unlink()
+    url = arg.get('url', '').strip()
+    raw = fetch(url).decode('utf-8-sig') if url else arg.get('value', '').lstrip('﻿')
+    if len(raw.encode()) > 8 * 1024 * 1024:
+        raise ValueError('导入文件过大，最大支持 8 MiB')
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        parsed = None
+    is_config = isinstance(parsed, dict) and isinstance(parsed.get('outbounds'), list)
+    nodes = node_objects(parsed) if is_config else sub_parse(raw)
+    ticket = secrets.token_hex(16)
+    save(IMPORT_DIR / (ticket + '.json'), json.dumps({'raw': raw, 'url': url, 'config': is_config}).encode())
+    return {'ticket': ticket, 'isConfig': is_config, 'count': len(nodes), 'source': 'link' if url else 'file'}
+
+def commit_import(arg):
+    ticket = arg['ticket']
+    if not re.fullmatch('[0-9a-f]{32}', ticket):
+        raise ValueError('导入凭证无效')
+    p = IMPORT_DIR / (ticket + '.json')
+    if not p.exists() or time.time() - p.stat().st_mtime > 900:
+        raise ValueError('导入预览已过期，请重新选择')
+    data = json.loads(p.read_bytes())
+    name = arg['name'].strip()
+    validate(name)
+    mode = arg['mode']
+    if mode == 'config':
+        if not data['config']:
+            raise ValueError('此文件仅支持导入节点')
+        if (profiles / (name + '.json')).exists():
+            raise ValueError('配置名称已存在')
+        cfg = json.loads(data['raw'])
+        obj = {'config': cfg}
+        if data['url']:
+            obj['url'] = data['url']
+        write_profile(name, obj, False)
+    elif mode == 'nodes':
+        nodes = sub_parse(data['raw'])
+        for n in nodes:
+            validate_node(n)
+        obj = read_obj('base')
+        if data['url']:
+            subs = obj.setdefault('subs', [])
+            if any(s['name'] == name for s in subs):
+                raise ValueError('订阅名称已存在')
+            subs.append(dict(name=name, url=data['url'], nodes=nodes))
+        else:
+            existing = {n.get('tag') for n in obj.get('nodes', [])}
+            if any(n['tag'] in existing for n in nodes):
+                raise ValueError('手动节点名称重复，请更改名称')
+            obj.setdefault('nodes', []).extend(nodes)
+        write_profile('base', obj)
+    else:
+        raise ValueError('导入方式无效')
+    p.unlink()
+    return {'ok': True}
+
+def add_manual_node(arg):
+    node = json.loads(arg['value'])
+    validate_node(node)
+    obj = read_obj('base')
+    if any(n.get('tag') == node['tag'] for n in obj.get('nodes', [])):
+        raise ValueError('手动节点名称已存在')
+    obj.setdefault('nodes', []).append(node)
+    write_profile('base', obj)
+    return {'ok': True}
+
+def probe_catalog(scope):
+    entries = catalog()
+    if scope and scope != 'all':
+        entries = [x for x in entries if ('base:' + x['source'] if x['owner'] == 'base' else 'profile:' + x['owner']) == scope]
+    if not entries:
+        return {'delays': {}}
+    with tempfile.TemporaryDirectory(prefix='sb-probe-', dir='/tmp') as td:
+        root = pathlib.Path(td)
+        with socket.socket() as sock:
+            sock.bind(('127.0.0.1', 0))
+            port = sock.getsockname()[1]
+        nodes = []
+        for entry in entries:
+            n = json.loads(json.dumps(entry['node']))
+            n['tag'] = entry['id']
+            nodes.append(n)
+        cfg = {'log': {'level': 'error'}, 'outbounds': nodes + [dict(type='direct', tag='_probe-direct')],
+               'dns': {'servers': [dict(type='udp', tag='local', server='223.5.5.5')]},
+               'route': {'final': '_probe-direct', 'default_domain_resolver': {'server': 'local', 'strategy': 'ipv4_only'}, 'default_mark': 0x2024},
+               'experimental': {'clash_api': {'external_controller': '127.0.0.1:' + str(port)}}}
+        path = root / 'probe.json'
+        path.write_text(json.dumps(cfg))
+        with (root / 'log').open('w') as log:
+            proc = sp.Popen([str(D / 'core'), 'run', '-D', td, '-c', str(path)], stdout=log, stderr=log)
+        def request(suffix):
+            r = sp.run(['curl', '-fsS', '--max-time', '8', 'http://127.0.0.1:' + str(port) + suffix], capture_output=True)
+            if r.returncode:
+                raise ValueError('测速连接失败')
+            return json.loads(r.stdout)
+        try:
+            for _ in range(35):
+                if proc.poll() is not None:
+                    raise ValueError('测速内核启动失败，请检查节点参数')
+                try:
+                    request('/version')
+                    break
+                except Exception:
+                    time.sleep(.15)
+            def probe(entry):
+                for attempt in range(2):
+                    try:
+                        url = '/proxies/' + entry['id'] + '/delay?timeout=5000&url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204'
+                        delay = int(request(url).get('delay', 0))
+                        if delay > 0:
+                            return entry['id'], delay
+                    except Exception:
+                        pass
+                return entry['id'], -1
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                values = dict(pool.map(probe, entries))
+            return {'delays': values}
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except sp.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+def update_items():
+    subs = read_obj('base').get('subs', [])
+    items = [dict(id='sub:' + s['name'], name=s['name'], kind='订阅节点') for s in subs]
+    for p in profiles_info():
+        if p['kind'] in ('remote', 'subscription'):
+            items.append(dict(id='profile:' + p['name'], name=p['name'], kind='配置' if p['kind'] == 'remote' else '订阅节点'))
+    return items
+
+def update_options():
+    items = update_items()
+    saved = json.loads(UPDATE_FILE.read_bytes()) if UPDATE_FILE.exists() else None
+    if saved is None:
+        chosen = [x['id'] for x in items]
+    else:
+        chosen = [x for x in saved.get('selected', []) if x in {i['id'] for i in items}]
+    return {'items': items, 'selected': chosen, 'schedule': schedule('unified')}
+
+def save_update_selection(value):
+    selected = json.loads(value)
+    allowed = {x['id'] for x in update_items()}
+    if not isinstance(selected, list) or any(not isinstance(x, str) or x not in allowed for x in selected):
+        raise ValueError('更新选择已改变，请刷新后重试')
+    save(UPDATE_FILE, json.dumps({'selected': list(dict.fromkeys(selected))}, ensure_ascii=False).encode())
+    return {'ok': True}
+
+def update_selected():
+    chosen = update_options()['selected']
+    old_base = read_obj('base')
+    updated_base = json.loads(json.dumps(old_base))
+    staged = {}
+    errors = []
+    successful = []
+    for identity in chosen:
+        try:
+            kind, name = identity.split(':', 1)
+            if kind == 'sub':
+                sub = next(x for x in updated_base['subs'] if x['name'] == name)
+                nodes = sub_parse(fetch(sub['url']).decode('utf-8-sig'))
+                for n in nodes:
+                    validate_node(n)
+                sub['nodes'] = nodes
+            else:
+                obj = read_obj(name)
+                if 'suburl' in obj:
+                    obj['nodes'] = sub_parse(fetch(obj['suburl']).decode('utf-8-sig'))
+                else:
+                    obj['config'] = json.loads(fetch(obj['url']))
+                render(json.dumps(profile_config(obj)).encode())
+                staged[name] = obj
+            successful.append(identity)
+        except Exception as exc:
+            errors.append({'id': identity, 'error': str(exc)})
+    backups = {}
+    if updated_base != old_base:
+        staged['base'] = updated_base
+    active = active_name()
+    try:
+        for name, obj in staged.items():
+            path = profiles / (name + '.json')
+            backups[name] = path.read_bytes()
+            obj['nodeCount'] = len(node_objects(profile_config(obj)))
+            save(path, json.dumps(obj, ensure_ascii=False).encode())
+        if active in staged:
+            install(active, True)
+    except Exception:
+        for name, raw in backups.items():
+            save(profiles / (name + '.json'), raw)
+        raise
+    return {'ok': not errors, 'updated': successful, 'failures': errors}
+
+PANELS = [dict(id='official', name='SagerNet 官方面板'),
+          dict(id='yacd', name='Yacd Meta'), dict(id='metacubexd', name='MetaCubeXD'),
+          dict(id='zashboard', name='Zashboard'), dict(id='custom', name='自定义 HTTPS 地址')]
+
+def panel_link(pid, url):
+    token = (D / 'token').read_text()
+    if pid == 'official':
+        return 'http://' + LAN + ':9091/dashboard/#router-secret=' + urllib.parse.quote(token)
+    ports = {'yacd':9092,'metacubexd':9093,'zashboard':9094}
+    if pid in ports:
+        return 'http://' + LAN + ':' + str(ports[pid]) + '/luci-connect.html#' + urllib.parse.urlencode({'token':token,'kind':pid})
+    return url + ('&' if '?' in url else '?') + urllib.parse.urlencode(dict(hostname=LAN,port=9090,secret=token))
+
+
+def save_update_policy(arg):
+    before = UPDATE_FILE.read_bytes() if UPDATE_FILE.exists() else None
+    cron = pathlib.Path('/etc/crontabs/root').read_bytes()
+    try:
+        save_update_selection(arg['selected'])
+        lines = [line for line in cron.decode().splitlines()
+                 if line.split()[5:8] not in [CRONS['nodes'].split(), CRONS['config'].split()]]
+        sp.run(['crontab', '-'], input=('\n'.join(lines) + '\n').encode(), check=True)
+        set_schedule('unified', arg)
+    except Exception:
+        sp.run(['crontab', '-'], input=cron, check=True)
+        if before is None:
+            UPDATE_FILE.unlink(missing_ok=True)
+        else:
+            save(UPDATE_FILE, before)
+        raise
+    return {'ok': True}
+
+def configure_strict_route():
+    path = D / 'tun.json'
+    cfg = json.loads(path.read_bytes())
+    for inbound in cfg['inbounds']:
+        if inbound['type'] == 'tun':
+            inbound['strict_route'] = True
+    tmp = D / 'tun-strict.json'
+    save(tmp, json.dumps(cfg).encode())
+    r = sp.run([str(D / 'core'), 'check', '-D', str(D), '-c', str(tmp)], capture_output=True)
+    if r.returncode:
+        raise ValueError('严格路由校验失败')
+    os.replace(tmp, path)
+
+
+def action(method, arg):
+    name = arg.get('name', '')
+    if method == 'catalog':
+        return catalog_public()
+    if method == 'catalog-get':
+        entry = find_entry(arg['id'])
+        if not entry:
+            raise ValueError('节点已改变，请刷新')
+        return {'value': json.dumps(entry['node'], ensure_ascii=False), 'id': entry['id']}
+    if method == 'catalog-set':
+        return change_catalog(arg)
+    if method == 'catalog-del':
+        return change_catalog(arg, True)
+    if method == 'manual-add':
+        return add_manual_node(arg)
+    if method == 'import-inspect':
+        return inspect_import(arg)
+    if method == 'import-commit':
+        return commit_import(arg)
+    if method == 'catalog-delay':
+        return probe_catalog(arg.get('scope', 'all'))
+    if method == 'update-options':
+        return update_options()
+    if method == 'update-selection':
+        return save_update_selection(arg['selected'])
+    if method == 'update-policy':
+        return save_update_policy(arg)
+    if method in ('update-selected', 'refresh-selected', 'refresh-nodes', 'refresh-config'):
+        return update_selected()
+    if method == 'strict-route':
+        configure_strict_route()
+        return {'ok': True}
+    if method == 'status':
+        try:
+            ensure_base()
+        except Exception:
+            pass
+        return dict(schedules={'nodes': schedule('nodes'), 'config': schedule('config')},
+                    baseMode=base_mode(), updates=update_options(),
+                    schedule=schedule('nodes'),
+                    autostart=sp.run([INIT, 'enabled'], capture_output=True).returncode == 0,
+                    profiles=[p['name'] for p in profiles_info()],
+                    profileList=profiles_info(),
+                    active=(D / 'selected').read_text() if (D / 'selected').exists() else '',
+                    running=pathlib.Path('/sys/class/net/sb-zh').exists(),
+                    uptime=uptime_seconds(), kernel=kernel_version(), panel=panel_state(),
+                    coreUpdate=__import__('core_update').preferences())
+    if method == 'token':
+        return {'token': (D / 'token').read_text()}
+    if method == 'schedule':
+        return set_schedule(arg.get('kind', 'nodes'), arg)
+    if method == 'autostart':
+        sp.run([INIT, 'enable' if arg['enabled'] else 'disable'], check=True)
+        return {'ok': True}
+    if method in ('start', 'stop'):
+        return control(method == 'start')
+    if method == 'restart':
+        return restart_service()
+    if method == 'refresh':
+        name = (D / 'selected').read_text().strip()
+    if method == 'refresh-nodes':
+        return refresh_nodes() or {'ok': True}
+    if method == 'refresh-config':
+        return refresh_config() or {'ok': True}
+    if method == 'kernel':
+        from core_update import handle
+        return handle(arg)
+    if method == 'profiles':
+        return {'profiles': profiles_info()}
+    if method == 'logs':
+        return logs(arg)
+    if method == 'refresh-counts':
+        return refresh_counts()
+    if method == 'sub-list':
+        return base_sub_list()
+    if method == 'sub-add':
+        return base_sub_add(arg.get('name', ''), arg.get('url', ''))
+    if method == 'sub-del':
+        return base_sub_del(arg.get('name', ''))
+    if method == 'sub-refresh':
+        return base_sub_refresh(arg.get('name', ''))
+    if method == 'base-mode':
+        if arg.get('mode'):
+            return set_base_mode(arg['mode'])
+        return {'mode': base_mode()}
+    if method == 'token-set':
+        return set_token(arg)
+    if method == 'panel':
+        return panel_state()
+    if method == 'panel-set':
+        return panel_set(arg)
+    validate(name)
+    if method in ('readprofile', 'editprofile', 'nodes'):
+        return profile_action(method, arg, name)
+    if method in ('node-list', 'node-delay', 'node-get', 'node-set', 'node-del'):
+        if method == 'node-list':
+            obj = json.loads((profiles / (name + '.json')).read_bytes())
+            if 'base' in obj:
+                return {'nodes': [{'tag': n['tag'], 'type': n['type'], 'server': n.get('server', ''),
+                                   'port': n.get('server_port', 0), 'source': src}
+                                  for n, src in base_all_nodes(obj)]}
+            return {'nodes': node_list(profile_config(obj))}
+        if method == 'node-delay':
+            return node_delays(name)
+        if method == 'node-get':
+            return node_get(name, arg['tag'])
+        if method == 'node-set':
+            return node_set(name, arg['tag'], arg['value'])
+        return node_del(name, arg['tag'])
+    if method == 'delete':
+        return profile_delete(name)
+    if method == 'sublink':
+        return sublink(name, arg['url'], arg.get('new', False))
+    if method in ('link', 'upload'):
+        if method == 'link':
+            obj = {'url': arg['value']}
+            raw = fetch(obj['url'])
+        else:
+            obj = {'config': json.loads(arg['value'])}
+            raw = arg['value'].encode()
+        if not isinstance(json.loads(raw).get('outbounds'), list):
+            raise ValueError('需要完整 sing-box JSON')
+        render(raw)
+        save(profiles / (name + '.json'), json.dumps(obj, ensure_ascii=False).encode())
+    elif method in ('apply', 'refresh'):
+        install(name, True)
+    elif method == 'prepare':
+        install(name, False)
+        os.replace(D / 'candidate.json', D / 'active.json')
+    else:
+        raise ValueError('unknown method')
+    return {'ok': True}
+
+
+methods = {'status': {}, 'token': {}, 'link': {'name': '', 'value': ''}, 'upload': {'name': '', 'value': ''},
+           'apply': {'name': ''}}
+if sys.argv[1] == 'list':
+    print(json.dumps(methods))
+    sys.exit()
+try:
+    with (D / 'lock').open('w') as lock:
+        method = sys.argv[2]
+        if method not in ('status', 'token', 'logs', 'profiles', 'panel', 'node-list', 'node-delay', 'node-get', 'catalog', 'catalog-get', 'update-options'):
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        arg = json.load(sys.stdin) if sys.argv[1] == 'call' else {'name': sys.argv[3] if len(sys.argv) > 3 else ''}
+        print(json.dumps(action(method, arg), ensure_ascii=False))
+except Exception as exc:
+    print(json.dumps({'error': str(exc)}, ensure_ascii=False))
+    sys.exit(0 if sys.argv[1] == 'call' else 1)
