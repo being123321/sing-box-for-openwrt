@@ -1,9 +1,7 @@
 name: Build and release
 on:
   push:
-    branches: ['main']
     tags: ['v*']
-    paths: ['project-source.tar.gz']
   workflow_dispatch:
 permissions:
   contents: write
@@ -12,17 +10,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Import initial source archive
-        if: hashFiles('project-source.tar.gz') != ''
-        run: |
-          echo 'eb1a71fd6b41b375dc273f39de2fe0c0de222150332ce14514e9e89627d91f80  project-source.tar.gz' | sha256sum -c -
-          tar xzf project-source.tar.gz
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add README.md LICENSE VERSION RELEASE_NOTES.md .gitignore install.sh files assets scripts tests
-          git rm project-source.tar.gz
-          git commit -m 'Import verified portable management source'
-          git push origin HEAD:main
       - name: Validate source
         run: python3 tests/test_source.py
       - name: Build IPK and APK without core
@@ -31,6 +18,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag="v$(cat VERSION)"
+          tag="v$(tr -d '\r\n' < VERSION)"
           gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --title "sing-box for openwrt $tag" --notes-file RELEASE_NOTES.md
           gh release upload "$tag" dist/luci-app-sb-router.apk dist/luci-app-sb-router.ipk dist/install.sh dist/SHA256SUMS --clobber
