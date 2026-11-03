@@ -19,8 +19,9 @@ methods.update({'server-list':{},'server-get':{'id':''},'server-save':{'id':'','
                 'server-delete':{'id':'','revision':''},'server-generate':{'kind':'password'},'dependencies':{},'dependencies-install':{}})
 methods.update({'telemetry':{},'item-policy-get':{'id':''},'item-policy-set':{'id':'','policy':'{}'},'item-update':{'id':''},'certificates':{},'certificate-issue':{'domain':'','email':'','provider':'cloudflare','token':'','agree':False},'server-share':{'id':'','host':'','user':0},'proxy-list':{},'proxy-save':{'id':'','domain':'','target':'','port':443,'https':True,'certificate':'','key':'','enabled':True,'firewall':True},'proxy-delete':{'id':''}})
 methods.update({'usage-status':{},'refresh-usage':{'force':True},'runtime':{},'nodes-delete':{'ids':'[]'},'site-status':{},'site-check':{},'profile-api':{'name':''},'profile-api-set':{'name':'','port':9090,'secret':'','reset':False},'profile-update':{'name':''},'node-copy':{'ids':'[]','target':'','overwrite':False},'copy-policy':{'name':'','overwrite':False}})
+methods.update({'node-share':{'id':''},'profile-share':{'name':''},'selection':{},'selection-set':{'value':'{}'}})
 
-SYNC = {'usage-status','runtime','site-status','profile-api','status', 'token', 'logs', 'profiles', 'panel', 'node-list', 'node-get', 'sub-list', 'catalog', 'catalog-get', 'update-options','server-list','server-get','dependencies','telemetry','item-policy-get','proxy-list'}
+SYNC = {'usage-status','runtime','site-status','profile-api','status', 'token', 'logs', 'profiles', 'panel', 'node-list', 'node-get', 'sub-list', 'catalog', 'catalog-get', 'update-options','server-list','server-get','dependencies','telemetry','item-policy-get','proxy-list','selection','selection-set'}
 if sys.argv[1] == 'list':
     print(json.dumps(methods))
     sys.exit()

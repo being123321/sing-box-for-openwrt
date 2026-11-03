@@ -18,7 +18,8 @@
           "proxy-list",
           "site-status",
           "runtime",
-          "usage-status"
+          "usage-status",
+          "selection"
         ]
       }
     },
@@ -83,7 +84,10 @@
           "node-copy",
           "copy-policy",
           "nodes-delete",
-          "refresh-usage"
+          "refresh-usage",
+          "node-share",
+          "profile-share",
+          "selection-set"
         ]
       },
       "file": {

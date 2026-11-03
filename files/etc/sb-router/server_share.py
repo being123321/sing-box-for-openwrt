@@ -1,5 +1,6 @@
 import base64,json,subprocess,urllib.parse,ipaddress,re
 import server_manager
+from share import qr_svg
 def b64(data):
     return base64.urlsafe_b64encode(data).decode().rstrip('=')
 def share(arg):
@@ -56,4 +57,6 @@ def share(arg):
               'sni':sni,'path':transport.get('path',''),'host':transport.get('headers',{}).get('Host','')}
         link='vmess://'+base64.b64encode(json.dumps(data).encode()).decode()
     else:link=scheme+'://'+auth+'@'+address+('?' + urllib.parse.urlencode(query) if query else '')+'#'+quote(cfg['tag'])
-    return {'link':link,'warning':'链接含认证信息，只分享给可信的人。','users':[u.get('name') or u.get('username') or str(i+1) for i,u in enumerate(users)]}
+    try:qrcode=qr_svg(link)
+    except ValueError:qrcode=''
+    return {'link':link,'qr':qrcode,'warning':'链接含认证信息，只分享给可信的人。','users':[u.get('name') or u.get('username') or str(i+1) for i,u in enumerate(users)]}

@@ -32,11 +32,13 @@ var usageStatus=api('usage-status');
 var telemetry=api('telemetry'),itemPolicy=api('item-policy-get',['id']),itemSet=api('item-policy-set',['id','policy']),itemUpdate=api('item-update',['id']);
 var certScan=api('certificates'),certIssue=api('certificate-issue',['domain','email','provider','token','agree']);
 var shareServer=api('server-share',['id','host','user']);
+var shareNode=api('node-share',['id']),shareProfile=api('profile-share',['name']);
+var selectionGet=api('selection'),selectionSet=api('selection-set',['value']);
 var proxyList=api('proxy-list'),proxySave=api('proxy-save',['id','domain','target','port','https','certificate','key','enabled','firewall']),proxyDelete=api('proxy-delete',['id']);
 
 return view.extend({
   handleSaveApply: null, handleSave: null, handleReset: null,
-  load: function () { return Promise.all([getStatus(), getCatalog(),serversList(),dependencies(),telemetry(),proxyList(),siteStatus(),usageStatus()]); },
+  load: function () { return Promise.all([getStatus(), getCatalog(),serversList(),dependencies(),telemetry(),proxyList(),siteStatus(),usageStatus(),selectionGet()]); },
   render: function (initial) {
     var state = initial[0], catalog = initial[1], profiles = state.profileList || [];
     var serverState=initial[2],dependencyState=initial[3];
@@ -426,17 +428,50 @@ return view.extend({
       if(ms<0)return ['超时','#c33'];
       return [ms+' ms',ms<=100?'#198f41':ms<=250?'#458b34':ms<=600?'#b07600':'#c46a22'];
     }
-    var selectedNodeIds=new Set(),selectionMode=false,selectionBar=E('div',{'class':'sb-selection-bar',hidden:true}),selectionCount=E('strong');
+    var selectionState=initial[8]||{},selectionMode=!!selectionState.visible,selectionByScope=selectionState.scopes||{};
+    var selectedNodeIds=new Set(),selectionTimer=0,selectionBar=E('div',{'class':'sb-selection-bar',hidden:true}),selectionCount=E('strong');
+    (function restoreSelection(){
+      var known=new Set((catalog.nodes||[]).concat(catalog.configNodes||[]).map(function(x){return x.id;}));
+      Object.keys(selectionByScope).forEach(function(key){
+        selectionByScope[key]=(selectionByScope[key]||[]).filter(function(id){return known.has(id);});
+        if(!selectionByScope[key].length)delete selectionByScope[key];
+      });
+      Object.keys(selectionByScope).forEach(function(key){selectionByScope[key].forEach(function(id){selectedNodeIds.add(id);});});
+    })();
+    function scopeOf(el){var box=el&&el.closest?el.closest('[data-node-origin]'):null;return box?box.dataset.nodeOrigin:'all';}
+    function saveSelection(){
+      clearTimeout(selectionTimer);
+      selectionTimer=setTimeout(function(){
+        selectionSet(JSON.stringify({visible:selectionMode,scopes:selectionByScope})).catch(function(){});
+      },400);
+    }
+    function addSelected(id,scope){
+      var list=selectionByScope[scope]||(selectionByScope[scope]=[]);
+      if(list.indexOf(id)<0)list.push(id);
+      selectedNodeIds.add(id);
+    }
+    function dropSelected(id){
+      selectedNodeIds.delete(id);
+      Object.keys(selectionByScope).forEach(function(key){
+        var index=selectionByScope[key].indexOf(id);
+        if(index>=0)selectionByScope[key].splice(index,1);
+        if(!selectionByScope[key].length)delete selectionByScope[key];
+      });
+    }
     function updateSelection(){
       selectionBar.hidden=!selectionMode;selectionCount.textContent='已选 '+selectedNodeIds.size+' 个节点';
       document.querySelectorAll('.sb-node-card[data-node-id]').forEach(function(card){var yes=selectedNodeIds.has(card.dataset.nodeId);card.classList.toggle('sb-node-selected',yes);var box=card.querySelector('.sb-node-check');if(box){box.hidden=!selectionMode;box.checked=yes;}});
     }
-    function selectNode(id,toggle){selectionMode=true;if(toggle&&selectedNodeIds.has(id))selectedNodeIds.delete(id);else selectedNodeIds.add(id);updateSelection();}
-    function selectionCheckbox(id){var box=checked(selectedNodeIds.has(id));box.className='sb-node-check';box.hidden=!selectionMode;box.title='选择此节点，用于批量删除或一起拖放';box.addEventListener('click',function(e){e.stopPropagation();selectNode(id,true);});return box;}
+    function selectNode(id,toggle,scope){
+      selectionMode=true;
+      if(toggle&&selectedNodeIds.has(id))dropSelected(id);else addSelected(id,scope||'all');
+      updateSelection();saveSelection();
+    }
+    function selectionCheckbox(id){var box=checked(selectedNodeIds.has(id));box.className='sb-node-check';box.hidden=!selectionMode;box.title='选择此节点，用于批量删除或一起拖放';box.addEventListener('click',function(e){e.stopPropagation();selectNode(id,true,scopeOf(box));});return box;}
     selectionBar.appendChild(selectionCount);
-    selectionBar.appendChild(button('全选当前显示',function(){selectionMode=true;document.querySelectorAll('#sec-config .sb-node-card[data-node-id]').forEach(function(card){if(!card.closest('[hidden]')&&card.getBoundingClientRect().width)selectedNodeIds.add(card.dataset.nodeId);});updateSelection();}));
+    selectionBar.appendChild(button('全选当前显示',function(){selectionMode=true;document.querySelectorAll('#sec-config .sb-node-card[data-node-id]').forEach(function(card){if(!card.closest('[hidden]')&&card.getBoundingClientRect().width)addSelected(card.dataset.nodeId,scopeOf(card));});updateSelection();saveSelection();}));
     selectionBar.appendChild(button('批量删除',function(){var ids=Array.from(selectedNodeIds),notice=E('p');if(!ids.length)return;dialog('批量删除节点',[E('p',{},'删除选中的 '+ids.length+' 个节点？原有订阅删除记录会保留，更新不会重新添加。'),notice,button('取消',close),button('确认删除',async function(){try{notice.textContent='正在校验并删除…';await run(batchDelete(JSON.stringify(ids)));}catch(e){notice.textContent=e.message;}})]);}));
-    selectionBar.appendChild(button('清空选择',function(){selectionMode=false;selectedNodeIds.clear();updateSelection();}));
+    selectionBar.appendChild(button('清空选择',function(){selectionMode=false;selectedNodeIds.clear();selectionByScope={};updateSelection();saveSelection();}));
     var dragPayload=null,pointerDrag=null,dragGhost=null;
     function copyDialog(ids,target){
       if(!ids.length)return;
@@ -466,16 +501,16 @@ return view.extend({
       function origin(){var container=el.closest('[data-node-origin]');return container?container.dataset.nodeOrigin:(el.dataset.scope==='all'?'all':'subscription:'+el.dataset.scope);}
       function draggedIds(){return isNode&&selectedNodeIds.has(ids[0])?Array.from(selectedNodeIds):ids;}
       el.draggable=true;el.title=isNode?'长按进入多选；继续拖动抓起已选节点，放到其他配置或组进行复制。':'拖动此组节点到其他配置；来源保留。';
-      if(isNode)el.addEventListener('click',function(e){if(e.target.closest('button,input,a'))return;if(Date.now()<skipClickUntil){e.preventDefault();return;}if(selectionMode)selectNode(ids[0],true);});
+      if(isNode)el.addEventListener('click',function(e){if(e.target.closest('button,input,a'))return;if(Date.now()<skipClickUntil){e.preventDefault();return;}if(selectionMode)selectNode(ids[0],true,scopeOf(el));});
       el.addEventListener('dragstart',function(e){
         if(e.target.closest('input,select,textarea,a')||(e.target!==el&&e.target.closest('button'))){e.preventDefault();return;}
-        clearPointer();if(isNode&&selectionMode)selectNode(ids[0],false);dragPayload={ids:draggedIds(),label:label,origin:origin()};e.dataTransfer.effectAllowed='copy';e.dataTransfer.setData('text/plain',label);el.classList.add('sb-dragging');
+        clearPointer();if(isNode&&selectionMode)selectNode(ids[0],false,scopeOf(el));dragPayload={ids:draggedIds(),label:label,origin:origin()};e.dataTransfer.effectAllowed='copy';e.dataTransfer.setData('text/plain',label);el.classList.add('sb-dragging');
       });
       el.addEventListener('dragend',function(){el.classList.remove('sb-dragging');dragPayload=null;document.querySelectorAll('.sb-drop-active').forEach(function(x){x.classList.remove('sb-drop-active');});});
       el.addEventListener('pointerdown',function(e){
         if(e.button!==0||(e.target!==el&&e.target.closest('button,a,input,select,textarea')))return;
         clearPointer();var data={el:el,x:e.clientX,y:e.clientY,id:e.pointerId,armed:false,ids:ids};pointerDrag=data;
-        data.timer=setTimeout(function(){if(pointerDrag!==data)return;data.armed=true;data.origin=origin();data.moved=false;if(isNode)selectNode(ids[0],false);data.ids=draggedIds();el.classList.add('sb-dragging');try{el.setPointerCapture(data.id);}catch(_){}},450);
+        data.timer=setTimeout(function(){if(pointerDrag!==data)return;data.armed=true;data.origin=origin();data.moved=false;if(isNode)selectNode(ids[0],false,scopeOf(el));data.ids=draggedIds();el.classList.add('sb-dragging');try{el.setPointerCapture(data.id);}catch(_){}},450);
       });
       el.addEventListener('pointermove',function(e){
         var data=pointerDrag;if(!data||data.el!==el)return;
@@ -513,7 +548,7 @@ return view.extend({
         var card=E('div',{'data-node-id':n.id,'class':'sb-node-card',style:'border:1px solid #bbb;border-radius:7px;padding:10px;overflow-wrap:anywhere'},[
           selectionCheckbox(n.id),E('strong',{},n.tag),E('div',{},n.type+' · '+n.server+':'+n.port),
           E('div',{style:'font-size:12px;opacity:.7'},n.source?'订阅 '+n.source:'手动添加'),
-          E('p',{style:'color:'+q[1]},q[0]),button('编辑',function(){return editNode(n.id);}),button('删除',function(){return removeNode(n.id);})
+          E('p',{style:'color:'+q[1]},q[0]),button('分享',function(){return shareNodeDialog(n.id);}),button('编辑',function(){return editNode(n.id);}),button('删除',function(){return removeNode(n.id);})
         ]);bindDrag(card,[n.id],n.tag);grid.appendChild(card);
       });
       nodeContainer.appendChild(grid);nodeContainer.dataset.nodeOrigin=scope==='all'?'all':'subscription:'+scope;nodeContainer.dataset.copyTarget=nodeContainer.dataset.nodeOrigin;updateSelection();
@@ -524,14 +559,27 @@ return view.extend({
     (catalog.subscriptions||[]).forEach(function(sub){
       var tab=E('button',{'class':'btn cbi-button','data-scope':sub.id,click:function(){setScope(sub.id);}},sub.name+'（'+sub.count+'）');nodeTabs.appendChild(tab);bindDrop(tab,'subscription:'+sub.id);bindDrag(tab,(catalog.nodes||[]).filter(function(n){return (n.owner==='base'?'base:'+n.source:'profile:'+n.owner)===sub.id;}).map(function(n){return n.id;}),sub.name+' 的节点');
     });
+    function changedFormValues(original,before,after){
+      if(JSON.stringify(before)===JSON.stringify(after))return JSON.parse(JSON.stringify(original));
+      if(after===null||typeof after!=='object'||Array.isArray(after))return JSON.parse(JSON.stringify(after));
+      var output=original&&typeof original==='object'&&!Array.isArray(original)?JSON.parse(JSON.stringify(original)):{};
+      Object.keys(before||{}).forEach(function(key){if(!Object.prototype.hasOwnProperty.call(after,key))delete output[key];});
+      Object.keys(after).forEach(function(key){
+        if(JSON.stringify((before||{})[key])!==JSON.stringify(after[key]))output[key]=changedFormValues(output[key],(before||{})[key],after[key]);
+      });
+      return output;
+    }
     async function editNode(id) {
       var r=await nodeGet(id);if(r.error)throw Error(r.error);
-      var form=manualForm(JSON.parse(r.value)),advanced=E('textarea',{rows:12,style:'width:100%;font-family:monospace'}),useJSON=false;
+      var originalNode=JSON.parse(r.value),form=manualForm(originalNode),formBaseline=form.get(),advanced=E('textarea',{rows:12,style:'width:100%;font-family:monospace'}),useJSON=false;
       advanced.value=JSON.stringify(JSON.parse(r.value),null,2);advanced.hidden=true;
       var notice=E('p');
-      dialog('编辑节点',[form.el,advanced,button('表单 / JSON',function(){useJSON=!useJSON;form.el.hidden=useJSON;advanced.hidden=!useJSON;}),notice,
+      dialog('编辑节点',[E('p',{'class':'sb-muted'},'本地节点直接保存。订阅或远程配置只改跳过证书验证：原名保留，更新后继续生效。更改其他参数：创建带“本地修改”后缀的受保护副本，原节点继续更新。'),form.el,advanced,button('表单 / JSON',function(){useJSON=!useJSON;form.el.hidden=useJSON;advanced.hidden=!useJSON;}),notice,
+        button('分享',function(){return shareNodeDialog(id,function(){editNode(id);});},'分享已保存的节点，未保存的修改不会包含。'),
         button('取消',close),button('校验并保存',async function(){try{
-          var n=useJSON?JSON.parse(advanced.value):form.get();notice.textContent='正在保存…';await run(nodeSet(id,JSON.stringify(n)));
+          var n=useJSON?JSON.parse(advanced.value):changedFormValues(originalNode,formBaseline,form.get());notice.textContent='正在保存…';
+          var saved=await result(nodeSet(id,JSON.stringify(n)));
+          dialog('节点已保存',[E('p',{},saved.message||'节点已保存。'),E('p',{},'保存名称：'+(saved.tag||n.tag)),button('完成',function(){location.reload();})]);
         }catch(e){notice.textContent=e.message;}})]);
     }
     function removeNode(id) {
@@ -577,7 +625,9 @@ return view.extend({
         if(data.remote)dest.value=isLink?name:name+'-local';
       }
       editMode.onchange=syncEditor;syncEditor();
-      dialog('编辑配置文件',[type,field('保存名称',dest),modeRow,sourceRow,hint,editorPolicy?editorPolicy.el:E('span'),field('更新时允许覆盖拖入的节点',overwriteCopied),E('p',{'class':'sb-muted'},'关闭时保留复制进来的节点；开启后，此远程配置更新时以来源为准，清除额外复制的节点。'),area,notice,button('取消',close),saveButton]);
+      dialog('编辑配置文件',[type,field('保存名称',dest),modeRow,sourceRow,hint,editorPolicy?editorPolicy.el:E('span'),field('更新时允许覆盖拖入的节点',overwriteCopied),E('p',{'class':'sb-muted'},'关闭时保留复制进来的节点；开启后，此远程配置更新时以来源为准，清除额外复制的节点。'),area,notice,
+        button('分享',function(){return shareProfileDialog(name,function(){editor(name);});},'分享已保存的配置链接和 JSON，未保存的修改不会包含。'),
+        button('取消',close),saveButton]);
     }
     function customTable() {
       var body=E('tbody');
@@ -585,13 +635,13 @@ return view.extend({
         var details=E('div',{'class':'sb-config-nodes','data-node-origin':'profile:'+p.name}),detailRow=E('tr',{'class':'sb-config-details',hidden:true},E('td',{colspan:3},details));
         var toggle=button('显示节点（'+p.nodes+'）',function(){detailRow.hidden=!detailRow.hidden;toggle.textContent=(detailRow.hidden?'显示':'收起')+'节点（'+p.nodes+'）';toggle.title=detailRow.hidden?'在此配置下方展开节点，支持长按多选和拖放。':'收起此配置的节点列表。';},'在此配置下方展开节点，支持长按多选和拖放。');
         (catalog.configNodes||[]).filter(function(n){return n.owner===p.name;}).forEach(function(n){
-          var card=E('div',{'class':'sb-node-card','data-node-id':n.id},[selectionCheckbox(n.id),E('strong',{},n.tag),E('small',{},n.type+' · '+n.server+':'+n.port),E('p',{},[button('编辑',function(){return editNode(n.id);}),button('删除',function(){return removeNode(n.id);})])]);
+          var card=E('div',{'class':'sb-node-card','data-node-id':n.id},[selectionCheckbox(n.id),E('strong',{},n.tag),E('small',{},n.type+' · '+n.server+':'+n.port),E('p',{},[button('分享',function(){return shareNodeDialog(n.id);}),button('编辑',function(){return editNode(n.id);}),button('删除',function(){return removeNode(n.id);})])]);
           bindDrag(card,[n.id],n.tag);details.appendChild(card);
         });
         var configRow=E('tr',{'class':'sb-config-summary'},[E('td',{},[E('strong',{},p.name),profileUsage(p),E('div',{},p.kind==='remote'?'链接配置':'本地配置'),E('small',{},'拖放到此行以复制节点')]),
           E('td',{'class':'sb-config-toggle'},toggle),E('td',{},[
             button('删除',function(){dialog('删除配置',[E('p',{},'确定删除 '+p.name+'？'),button('取消',close),button('删除',function(){return run(deleteProfile(p.name));})]);}),
-            button('编辑',function(){return editor(p.name);}),p.kind==='remote'?button('立即更新',function(){return run(profileUpdate(p.name),'正在更新并校验；运行失败将回退…');}):E('span'),button(p.active?'已应用':'应用',function(){return run(apply(p.name),'正在应用配置…');})
+            button('编辑',function(){return editor(p.name);}),button('分享',function(){return shareProfileDialog(p.name);}),p.kind==='remote'?button('立即更新',function(){return run(profileUpdate(p.name),'正在更新并校验；运行失败将回退…');}):E('span'),button(p.active?'已应用':'应用',function(){return run(apply(p.name),'正在应用配置…');})
           ])]);
         bindDrop(configRow,'profile:'+p.name);bindDrop(detailRow,'profile:'+p.name);body.appendChild(configRow);body.appendChild(detailRow);
       });
@@ -629,12 +679,83 @@ return view.extend({
           }catch(e){notice.textContent=e.message;}
         })]);
     }
+    function qrBox(svg){
+      var box=E('div',{'class':'sb-qr'});
+      box.innerHTML=svg||'';
+      return box;
+    }
+    function copyToClipboard(text,area){
+      try{
+        if(typeof navigator!=='undefined'&&navigator.clipboard&&navigator.clipboard.writeText)
+          return navigator.clipboard.writeText(text);
+      }catch(_){}
+      try{area.focus();area.select();document.execCommand('copy');}catch(_){}
+      return Promise.resolve();
+    }
+    function downloadText(filename,text){
+      var blob=new Blob([text],{type:'application/json;charset=utf-8'});
+      var url=URL.createObjectURL(blob),link=E('a',{href:url,download:filename});
+      document.body.appendChild(link);link.click();link.remove();
+      setTimeout(function(){URL.revokeObjectURL(url);},1500);
+    }
+    async function shareNodeDialog(id,back){
+      var data=await result(shareNode(id)),notice=E('p',{'class':'sb-muted'});
+      var area=E('textarea',{rows:4,readOnly:true,style:'width:100%;overflow-wrap:anywhere'});
+      area.value=data.link;
+      notice.textContent='协议：'+data.type+'；链接包含该节点的认证信息，只分享给可信的人。';
+      var children=[
+        field('节点链接',area),
+        data.qr?qrBox(data.qr):E('p',{'class':'sb-muted'},data.qrError||'内容较长，无法生成二维码，请复制链接。'),
+        E('p',{'class':'sb-muted'},'手机相机或客户端扫描二维码即可导入。'),
+        notice
+      ];
+      if(back)children.push(button('返回编辑',back));
+      children.push(button('关闭',close));
+      children.push(button('复制链接',function(){return copyToClipboard(data.link,area).then(function(){notice.textContent='已复制节点链接。';});}));
+      dialog('分享节点 · '+data.tag,children);
+    }
+    async function shareProfileDialog(name,back){
+      var data=await result(shareProfile(name)),notice=E('p',{'class':'sb-muted'});
+      var area=E('textarea',{rows:data.kind==='remote'?3:6,readOnly:true,style:'width:100%;overflow-wrap:anywhere'});
+      area.value=data.link||'';
+      var children=[
+        E('p',{},data.link?(data.kind==='remote'?'以下为该配置的订阅来源链接，可复制或扫码导入。':'本地配置没有订阅来源，以下为该配置全部节点链接（每行一个），可复制到客户端导入。'):'此配置没有可分享的节点。')
+      ];
+      if(data.link){
+        children.push(field(data.kind==='remote'?'订阅链接':'全部节点链接',area));
+        children.push(data.qr?qrBox(data.qr):E('p',{'class':'sb-muted'},data.qrError||'内容较长，无法生成二维码，请复制文字。'));
+        if(data.qr)children.push(E('p',{'class':'sb-muted'},data.kind==='remote'?'二维码内容为订阅链接，可扫码导入。':'二维码内容为该配置的 Base64 订阅文本，供支持文本导入的客户端使用。'));
+      }
+      if(data.json){
+        var jsonArea=E('textarea',{rows:12,readOnly:true,spellcheck:'false',style:'width:100%;font-family:monospace;font-size:12px'});
+        jsonArea.value=data.json;
+        children.push(E('h3',{},'配置文件 JSON'));
+        children.push(jsonArea);
+        children.push(E('p',{'class':'sb-muted'},'JSON 含节点认证和面板密钥，只分享给可信的人。'));
+        children.push(button('复制 JSON',function(){return copyToClipboard(data.json,jsonArea).then(function(){notice.textContent='已复制配置 JSON。';});}));
+        children.push(button('下载 .json 文件',function(){downloadText(data.filename,data.json);}));
+      }else if(data.jsonError){
+        children.push(E('p',{'class':'sb-muted'},data.jsonError));
+      }
+      children.push(notice);
+      notice.textContent='共 '+data.count+' 个节点'+(data.skipped&&data.skipped.length?'，其中 '+data.skipped.length+' 个协议暂不支持链接分享':'')+'。';
+      if(data.kind==='local'&&data.subscription){
+        var subArea=E('textarea',{rows:4,readOnly:true,hidden:true,style:'width:100%;overflow-wrap:anywhere'});
+        subArea.value=data.subscription;
+        children.push(button('显示 / 隐藏订阅文本',function(){subArea.hidden=!subArea.hidden;}));
+        children.push(subArea);
+      }
+      if(back)children.push(button('返回编辑',back));
+      children.push(button('关闭',close));
+      children.push(button('复制链接',function(){return copyToClipboard(area.value,area).then(function(){notice.textContent='已复制分享内容。';});}));
+      dialog('分享配置 · '+name,children);
+    }
     async function shareDialog(id){
       var data=await result(serverGet(id)),cfg=JSON.parse(data.value),tls=cfg.tls||{};
       var host=input('text',tls.server_name||(tls.certificate_provider||{}).domain?.[0]||''),users=options((cfg.users||[{}]).map(function(u,i){return [String(i),u.name||u.username||'用户 '+(i+1)];}));
-      var output=E('textarea',{rows:5,readOnly:true,style:'width:100%;overflow-wrap:anywhere'}),notice=E('p');
-      dialog('生成节点分享链接',[E('p',{},'填写接收方能够访问的域名或公网 IP。链接含认证信息，请只分享给可信的人。'),field('域名 / 公网 IP',host),field('分享的用户',users),output,notice,
-        button('关闭',close),button('生成链接',async function(){try{var r=await result(shareServer(id,host.value.trim(),+users.value));output.value=r.link;output.focus();output.select();notice.textContent='已生成并选中，可直接复制。';}catch(e){notice.textContent=e.message;}})]);
+      var output=E('textarea',{rows:5,readOnly:true,style:'width:100%;overflow-wrap:anywhere'}),notice=E('p'),qr=qrBox('');
+      dialog('生成节点分享链接',[E('p',{},'填写接收方能够访问的域名或公网 IP。链接含认证信息，请只分享给可信的人。'),field('域名 / 公网 IP',host),field('分享的用户',users),output,qr,notice,
+        button('关闭',close),button('生成链接',async function(){try{var r=await result(shareServer(id,host.value.trim(),+users.value));output.value=r.link;qr.innerHTML=r.qr||'';output.focus();output.select();notice.textContent='已生成并选中，可直接复制；也可以直接扫码导入。';}catch(e){notice.textContent=e.message;}})]);
     }
     function proxyEditor(existing){
       var item=existing||{},domain=input('text',item.domain||''),target=input('text',item.target||'http://127.0.0.1:3000');
@@ -841,7 +962,7 @@ return view.extend({
     var selected=location.hash.substring(1);if(!tabs.some(function(t){return t[0]===selected;}))selected='overview';
     switchTab(selected);
     return E('div',{'class':'sb-router-view'},[
-      E('style',{},'.sb-usage-note{display:block;font-size:12px;opacity:.75;line-height:1.6;margin:5px 0}.sb-total-value{font-size:24px;font-weight:bold}.sb-resource-grid,.sb-quota-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}.sb-resource{padding:14px;border:1px solid #bbb;border-radius:10px}.sb-resource div{padding:10px 0}.sb-resource progress{width:100%;height:10px;accent-color:#198f41}.sb-config-toggle button{max-width:100%;white-space:normal;line-height:1.5}.sb-project{padding:12px 0;border-bottom:1px solid #bbb}.sb-project:last-child{border-bottom:0}.sb-project>a{font-size:15px;font-weight:bold}.sb-project>p{margin:6px 0 0;line-height:1.6}.sb-runtime-summary{display:flex;gap:8px 20px;flex-wrap:wrap;align-items:center;padding:10px 0}.sb-runtime-summary small{width:100%;opacity:.75}.sb-runtime-locked{color:#c33;font-weight:bold}.sb-selection-bar{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);width:max-content;max-width:calc(100vw - 24px);display:flex;align-items:center;gap:6px;flex-wrap:wrap;z-index:100;box-shadow:0 4px 16px #0003;padding:10px;background:var(--background-color,#fff);border:1px solid #198f41;border-radius:7px}.sb-node-check{margin-right:8px!important;vertical-align:middle}.sb-node-selected{border-color:#198f41!important;background:rgba(25,143,65,.1)!important}.sb-config-summary>td{vertical-align:middle!important}.sb-config-details>td{padding:12px 0!important}.sb-config-details .sb-config-nodes{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;max-height:none;overflow:visible;width:100%}.sb-config-toggle{vertical-align:middle!important}.sb-panel-picker{padding-bottom:12px;border-bottom:1px solid #bbb}.sb-panel-current{overflow-wrap:anywhere;opacity:.8}.sb-section{border:1px solid #bbb;border-radius:9px;padding:16px;margin:12px 0;background:rgba(127,127,127,.025)}.sb-section>h3{margin:0 0 14px;font-size:18px}.sb-section table{width:100%;border-collapse:collapse}.sb-section th,.sb-section td{padding:12px 10px;text-align:left;vertical-align:top;border-bottom:1px solid #bbb}.sb-section label{display:inline-block;min-width:125px}.sb-muted{font-size:12px;opacity:.75}.sb-site-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:10px}.sb-site{border:1px solid #aaa;border-radius:7px;padding:12px}.sb-site small{margin-left:8px;opacity:.7}.sb-site.ok{border-left:4px solid #198f41}.sb-site.error{border-left:4px solid #c33}.sb-site.limited{border-left:4px solid #b07600}.sb-node-card{border:1px solid #bbb;border-radius:7px;padding:10px;margin:5px 0;overflow-wrap:anywhere;cursor:grab;user-select:none}.sb-node-card small{display:block}.sb-dragging{opacity:.65;outline:2px dashed #198f41}.sb-drop-active{outline:3px solid #198f41!important;background:rgba(25,143,65,.1)!important}.sb-drag-ghost{position:fixed;z-index:100000;pointer-events:none;background:#198f41;color:white;padding:10px;border-radius:7px}.sb-usage{padding:10px;background:rgba(25,143,65,.07);border-radius:7px;margin:8px 0}.sb-config-nodes{max-height:430px;overflow:auto}@media(max-width:700px){.sb-config-table{table-layout:auto!important}.sb-config-table th,.sb-config-table td{padding:7px 5px!important}.sb-section{padding:10px}.sb-section input:not([type=checkbox]),.sb-section select{max-width:100%}}.sb-router-view [hidden],.modal [hidden]{display:none!important}.sb-config-table{display:table!important;width:100%;table-layout:fixed;border-collapse:collapse}.sb-config-table thead{display:table-header-group!important}.sb-config-table tbody{display:table-row-group!important}.sb-config-table tr{display:table-row!important}.sb-config-table th,.sb-config-table td{display:table-cell!important;text-align:left!important;vertical-align:top;padding:12px 10px;border-bottom:1px solid #bbb;overflow-wrap:anywhere}.sb-config-table th{font-weight:bold;background:rgba(127,127,127,.08)}.sb-update-ready{background:#198f41!important;color:#fff!important;border-color:#198f41!important}'),
+      E('style',{},'.sb-usage-note{display:block;font-size:12px;opacity:.75;line-height:1.6;margin:5px 0}.sb-total-value{font-size:24px;font-weight:bold}.sb-resource-grid,.sb-quota-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}.sb-resource{padding:14px;border:1px solid #bbb;border-radius:10px}.sb-resource div{padding:10px 0}.sb-resource progress{width:100%;height:10px;accent-color:#198f41}.sb-config-toggle button{max-width:100%;white-space:normal;line-height:1.5}.sb-project{padding:12px 0;border-bottom:1px solid #bbb}.sb-project:last-child{border-bottom:0}.sb-project>a{font-size:15px;font-weight:bold}.sb-project>p{margin:6px 0 0;line-height:1.6}.sb-runtime-summary{display:flex;gap:8px 20px;flex-wrap:wrap;align-items:center;padding:10px 0}.sb-runtime-summary small{width:100%;opacity:.75}.sb-runtime-locked{color:#c33;font-weight:bold}.sb-selection-bar{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);width:max-content;max-width:calc(100vw - 24px);display:flex;align-items:center;gap:6px;flex-wrap:wrap;z-index:100;box-shadow:0 4px 16px #0003;padding:10px;background:var(--background-color,#fff);border:1px solid #198f41;border-radius:7px}.sb-node-check{margin-right:8px!important;vertical-align:middle}.sb-node-selected{border-color:#198f41!important;background:rgba(25,143,65,.1)!important}.sb-config-summary>td{vertical-align:middle!important}.sb-config-details>td{padding:12px 0!important}.sb-config-details .sb-config-nodes{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;max-height:none;overflow:visible;width:100%}.sb-config-toggle{vertical-align:middle!important}.sb-panel-picker{padding-bottom:12px;border-bottom:1px solid #bbb}.sb-panel-current{overflow-wrap:anywhere;opacity:.8}.sb-section{border:1px solid #bbb;border-radius:9px;padding:16px;margin:12px 0;background:rgba(127,127,127,.025)}.sb-section>h3{margin:0 0 14px;font-size:18px}.sb-section table{width:100%;border-collapse:collapse}.sb-section th,.sb-section td{padding:12px 10px;text-align:left;vertical-align:top;border-bottom:1px solid #bbb}.sb-section label{display:inline-block;min-width:125px}.sb-muted{font-size:12px;opacity:.75}.sb-site-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:10px}.sb-site{border:1px solid #aaa;border-radius:7px;padding:12px}.sb-site small{margin-left:8px;opacity:.7}.sb-site.ok{border-left:4px solid #198f41}.sb-site.error{border-left:4px solid #c33}.sb-site.limited{border-left:4px solid #b07600}.sb-node-card{border:1px solid #bbb;border-radius:7px;padding:10px;margin:5px 0;overflow-wrap:anywhere;cursor:grab;user-select:none}.sb-node-card small{display:block}.sb-dragging{opacity:.65;outline:2px dashed #198f41}.sb-drop-active{outline:3px solid #198f41!important;background:rgba(25,143,65,.1)!important}.sb-drag-ghost{position:fixed;z-index:100000;pointer-events:none;background:#198f41;color:white;padding:10px;border-radius:7px}.sb-usage{padding:10px;background:rgba(25,143,65,.07);border-radius:7px;margin:8px 0}.sb-qr{width:220px;max-width:100%;padding:8px;background:#fff;border:1px solid #bbb;border-radius:7px;margin:10px 0}.sb-qr svg{display:block;width:100%;height:auto}.sb-config-nodes{max-height:430px;overflow:auto}@media(max-width:700px){.sb-config-table{table-layout:auto!important}.sb-config-table th,.sb-config-table td{padding:7px 5px!important}.sb-section{padding:10px}.sb-section input:not([type=checkbox]),.sb-section select{max-width:100%}}.sb-router-view [hidden],.modal [hidden]{display:none!important}.sb-config-table{display:table!important;width:100%;table-layout:fixed;border-collapse:collapse}.sb-config-table thead{display:table-header-group!important}.sb-config-table tbody{display:table-row-group!important}.sb-config-table tr{display:table-row!important}.sb-config-table th,.sb-config-table td{display:table-cell!important;text-align:left!important;vertical-align:top;padding:12px 10px;border-bottom:1px solid #bbb;overflow-wrap:anywhere}.sb-config-table th{font-weight:bold;background:rgba(127,127,127,.08)}.sb-update-ready{background:#198f41!important;color:#fff!important;border-color:#198f41!important}'),
       E('h2',{},'sing-box'),nav,message,sections.overview,sections.config,sections.servers,sections.settings,sections.logs]);
   }
 });

@@ -444,6 +444,8 @@ def apply_node_edits(cfg, obj):
 
 
 def profile_config(obj):
+    from node_edits import migrate_tls,apply_tls
+    migrate_tls(obj)
     if 'base' in obj:
         cfg = base_config([n for n, _ in base_all_nodes(obj)], base_mode())
     elif 'suburl' in obj:
@@ -457,7 +459,8 @@ def profile_config(obj):
         if obj.get('nodes'):
             add_nodes(cfg, obj['nodes'])
     cfg = merge_copied(cfg, obj.get('copiedNodes', []))
-    return apply_node_edits(cfg, obj)
+    cfg = merge_copied(cfg, obj.get('localNodes', []))
+    return apply_tls(apply_node_edits(cfg, obj),obj.get('nodeTLS',{}))
 
 
 def node_list(cfg):
@@ -862,36 +865,35 @@ def node_get(name, tag):
 
 
 def node_set(name, tag, value):
-    path = profiles / (name + '.json')
-    original = json.loads(path.read_bytes())
-    cfg = profile_config(original)
-    node = json.loads(value)
-    if node.get('type') not in PROXY_TYPES or not node.get('server'):
-        raise ValueError('节点格式无效')
-    new_tag = node.get('tag') or tag
-    idx = next((i for i, x in enumerate(cfg['outbounds']) if x.get('tag') == tag), -1)
-    if idx < 0:
-        raise ValueError('节点不存在')
-    cfg['outbounds'][idx] = node
-    if new_tag != tag:
-        for x in cfg['outbounds']:
-            if x.get('type') in ('selector', 'urltest'):
-                x['outbounds'] = [new_tag if t == tag else t for t in x.get('outbounds', [])]
-                if x.get('default') == tag:
-                    x['default'] = new_tag
-    render(json.dumps(cfg).encode())
-    target = path
-    if 'url' in original or 'suburl' in original or 'base' in original:
-        original.setdefault('nodeOverrides', {})[tag] = node
-        if new_tag != tag:
-            dels = original.setdefault('nodeDels', [])
-            if tag not in dels:
-                dels.append(tag)
+    from node_edits import kind,local_copy,outcome
+    original=read_obj(name);cfg=profile_config(original);node=json.loads(value);validate_node(node)
+    old=next((x for x in cfg['outbounds'] if x.get('tag')==tag and x.get('type') in PROXY_TYPES),None)
+    if old is None:raise ValueError('节点不存在')
+    mode=kind(old,node)
+    if mode=='unchanged':return outcome(mode,tag)
+    local=next((x for x in original.get('localNodes',[])+original.get('copiedNodes',[]) if x.get('tag')==tag),None)
+    if ('url' in original or 'suburl' in original) and local is None:
+        if mode=='certificate':original.setdefault('nodeTLS',{})[tag]=bool((node.get('tls') or {}).get('insecure'))
+        else:
+            node=local_copy(node,{x.get('tag') for x in cfg['outbounds']}|set(original.get('nodeDels',[])))
+            original.setdefault('localNodes',[]).append(node)
     else:
-        original['config'] = cfg
-    original['copiedNodes']=[node if x.get('tag')==tag else x for x in original.get('copiedNodes',[])]
+        if node['tag']!=tag and any(x.get('tag')==node['tag'] for x in cfg['outbounds']):raise ValueError('节点名称已存在，请更换名称')
+        mode='local'
+        if local is not None:
+            original['copiedNodes']=[x for x in original.get('copiedNodes',[]) if x.get('tag')!=tag]
+            original['localNodes']=[x for x in original.get('localNodes',[]) if x.get('tag')!=tag]+[node]
+            original.get('nodeTLS',{}).pop(tag,None)
+        else:
+            for index,x in enumerate(cfg['outbounds']):
+                if x.get('tag')==tag:cfg['outbounds'][index]=node
+                elif x.get('type') in ('selector','urltest'):
+                    x['outbounds']=[node['tag'] if t==tag else t for t in x.get('outbounds',[])]
+                    if x.get('default')==tag:x['default']=node['tag']
+            original['config']=cfg
+            original['nodes']=[x for x in original.get('nodes',[]) if x.get('tag')!=tag]
     write_profile(name,original)
-    return {'ok': True}
+    return outcome(mode,node['tag'])
 
 
 def node_del(name, tag):
@@ -915,6 +917,8 @@ def node_del(name, tag):
     else:
         original['config'] = cfg
     original['copiedNodes']=[x for x in original.get('copiedNodes',[]) if x.get('tag')!=tag]
+    original['localNodes']=[x for x in original.get('localNodes',[]) if x.get('tag')!=tag]
+    original.get('nodeTLS',{}).pop(tag,None)
     write_profile(name,original)
     return {'ok': True}
 
@@ -1086,17 +1090,19 @@ def node_key(profile, source, original):
     return hashlib.sha256(json.dumps([profile, source, original], ensure_ascii=False).encode()).hexdigest()[:24]
 
 def base_entries(obj):
+    from node_edits import migrate_tls,patch_tls
+    migrate_tls(obj)
     entries = []
     used = set()
-    sources = [('', obj.get('nodes') or [], {}, [])]
+    sources = [('', obj.get('nodes') or [], {}, [], {})]
     for sub in obj.get('subs') or []:
-        sources.append((sub['name'], sub.get('nodes') or [], sub.get('overrides') or {}, sub.get('deleted') or []))
-    for source, nodes, overrides, deleted in sources:
+        sources.append((sub['name'], sub.get('nodes') or [], sub.get('overrides') or {}, sub.get('deleted') or [], sub.get('tlsOverrides') or {}))
+    for source, nodes, overrides, deleted, tls_values in sources:
         for index, original in enumerate(nodes):
             original_tag = original.get('tag') or original.get('server') or ('node-' + str(index))
             if original_tag in deleted:
                 continue
-            node = json.loads(json.dumps(overrides.get(original_tag, original)))
+            node = patch_tls(overrides.get(original_tag, original),tls_values,original_tag)
             tag = node.get('tag') or original_tag
             if tag in used:
                 suffix = hashlib.sha256((source + original_tag).encode()).hexdigest()[:6]
@@ -1146,23 +1152,32 @@ def change_catalog(arg, delete=False):
     if entry['owner'] != 'base':
         return node_del(entry['owner'], entry['original']) if delete else node_set(entry['owner'], entry['original'], arg['value'])
     obj = read_obj('base')
+    from node_edits import kind,local_copy,outcome,migrate_tls
+    migrate_tls(obj)
+    mode='local'
     source = entry['source']
     original = entry['original']
     if not delete:
         node = json.loads(arg['value'])
         validate_node(node)
+        if kind(entry['node'],node)=='unchanged':return outcome('unchanged',node['tag'])
     if source:
         sub = next(x for x in obj['subs'] if x['name'] == source)
         if delete:
             sub.setdefault('deleted', []).append(original)
             sub.get('overrides', {}).pop(original, None)
         else:
-            sub.setdefault('overrides', {})[original] = node
+            mode=kind(entry['node'],node)
+            if mode=='certificate':sub.setdefault('tlsOverrides',{})[original]=bool((node.get('tls') or {}).get('insecure'))
+            else:
+                node=local_copy(node,{x['node']['tag'] for x in base_entries(obj)})
+                obj.setdefault('nodes',[]).append(node)
     else:
         idx = next(i for i, n in enumerate(obj['nodes']) if (n.get('tag') or n.get('server')) == original)
         if delete:
             obj['nodes'].pop(idx)
         else:
+            if node['tag']!=entry['node']['tag'] and any(x['node']['tag']==node['tag'] for x in base_entries(obj)):raise ValueError('节点名称已存在，请更换名称')
             obj['nodes'][idx] = node
     if base_all_nodes(obj):
         write_profile('base', obj)
@@ -1171,7 +1186,8 @@ def change_catalog(arg, delete=False):
     else:
         obj['nodeCount'] = 0
         save(profiles / 'base.json', json.dumps(obj, ensure_ascii=False).encode())
-    return {'ok': True}
+    return {'ok':True} if delete else outcome(mode,node['tag'])
+
 
 def validate_node(node):
     if node.get('type') not in PROXY_TYPES or not isinstance(node.get('server'), str) or not node['server'].strip():
@@ -1515,7 +1531,8 @@ def save_update_selection(value):
 
 def update_selected(chosen=None, activate=True):
     chosen = update_options()['selected'] if chosen is None else chosen
-    old_base = read_obj('base')
+    from node_edits import migrate_tls
+    old_base = migrate_tls(read_obj('base'))
     updated_base = json.loads(json.dumps(old_base))
     staged = {}
     errors = []
@@ -1530,7 +1547,7 @@ def update_selected(chosen=None, activate=True):
                     validate_node(n)
                 sub['nodes'] = nodes
             else:
-                obj = read_obj(name)
+                obj = migrate_tls(read_obj(name))
                 if 'suburl' in obj:
                     obj['nodes'] = sub_parse(fetch(obj['suburl']).decode('utf-8-sig'))
                 else:
@@ -1768,6 +1785,8 @@ def delete_nodes_batch(arg):
             else:obj['nodes']=[n for n in obj.get('nodes',[]) if (n.get('tag') or n.get('server'))!=tag]
         else:
             obj['copiedNodes']=[n for n in obj.get('copiedNodes',[]) if n.get('tag')!=tag]
+            obj['localNodes']=[n for n in obj.get('localNodes',[]) if n.get('tag')!=tag]
+            obj.get('nodeTLS',{}).pop(tag,None)
             if 'url' in obj or 'suburl' in obj:
                 obj.setdefault('nodeDels',[]).append(tag);obj.get('nodeOverrides',{}).pop(tag,None)
             else:
@@ -1790,7 +1809,42 @@ def delete_nodes_batch(arg):
         raise
     return dict(ok=True,count=len(set(ids)))
 
+def selection_state():
+    import selection
+    return selection.read(D)
+
+
+def selection_save(value):
+    import selection
+    try:
+        data = json.loads(value or '{}')
+    except ValueError:
+        raise ValueError('选择状态格式无效')
+    return selection.write(D, data)
+
+
 def action(method, arg):
+    if method == 'selection':
+        return selection_state()
+    if method == 'selection-set':
+        return selection_save(arg.get('value', '{}'))
+    if method == 'node-share':
+        entry = find_entry(arg['id'])
+        if not entry:
+            raise ValueError('节点已改变，请刷新列表')
+        import share
+        return share.node_share(entry)
+    if method == 'profile-share':
+        name = arg['name']
+        validate(name)
+        obj = read_obj(name)
+        if obj.get('base'):
+            raise ValueError('请在基础配置的节点列表中选择节点分享')
+        # Never download a remote source just to build a share dialog; use the
+        # cached configuration and let the interface explain when it is missing.
+        cfg = profile_config(obj) if ('config' in obj or 'suburl' in obj) else {}
+        import share
+        return share.profile_share(name, obj, cfg)
     name = arg.get('name', '')
     if method in ('site-status','site-check'):
         import site_checks
