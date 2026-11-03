@@ -32,6 +32,12 @@ def preferences():
     try:return json.loads((ROOT/'core-update-settings.json').read_text())
     except (OSError,ValueError):return {'source':'official','channel':'testing'}
 
+def sha256_file(path):
+    digest=hashlib.sha256()
+    with pathlib.Path(path).open('rb') as stream:
+        for chunk in iter(lambda:stream.read(1024*1024),b''):digest.update(chunk)
+    return digest.hexdigest()
+
 def download(url, target=None):
     args=['curl','-4fsSL','--proto','=https','--proto-redir','=https','--connect-timeout','7','--max-time','150' if target else '25','--max-filesize',str(120000000 if target else 16000000)]
     if target:args+=['-o',str(target)]
@@ -192,8 +198,7 @@ def handle(arg):
         archive=pathlib.Path(tmp)/'download'
         binary=pathlib.Path(tmp)/'core'
         download(source_url(arg['source'],url),archive)
-        with archive.open('rb') as f:
-            if archive.stat().st_size!=size or hashlib.file_digest(f,'sha256').hexdigest()!=digest:raise ValueError('安装包未通过官方 SHA-256 校验')
+        if archive.stat().st_size!=size or sha256_file(archive)!=digest:raise ValueError('安装包未通过官方 SHA-256 校验')
         with tarfile.open(archive,'r:gz') as t:
             members=[m for m in t if m.isfile() and pathlib.PurePosixPath(m.name).name=='sing-box']
             if len(members)!=1 or members[0].size>256*1024*1024:raise ValueError('发布包内容无效')

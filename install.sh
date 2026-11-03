@@ -88,7 +88,7 @@ for package in $PACKAGES; do
     if [ "$PM" = apk ]; then
         apk info -e "$package" >/dev/null 2>&1 && continue
     else
-        opkg status "$package" 2>/dev/null | grep -qE '^Status: (install|hold) (ok|user) installed$' && continue
+        opkg status "$package" 2>/dev/null | grep -qE '^Status: (install|hold) (ok|user|hold)(,(ok|user|hold))* installed$' && continue
     fi
     MISSING="$MISSING $package"
 done

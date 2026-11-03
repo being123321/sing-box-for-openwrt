@@ -17,7 +17,7 @@ if command -v curl >/dev/null 2>&1; then curl -fL --proto '=https' --proto-redir
 
 脚本识别 OpenWrt / ImmortalWrt、APK / IPK 包管理器和 LAN 地址。内核下载器根据用户空间 ABI、CPU 架构和 musl 选择官方文件，并核验官方 SHA-256。默认最新测试版，稳定版加 --stable。没有官方适配包的架构会明确报错。
 
-需要支持 nftables 的较新 OpenWrt，内核应具备 TUN / nft queue。LuCI、Python 3.11+、curl 等依赖由当前系统仓库安装。旧版不支持的依赖、内核模块不匹配会停止安装。不会跨版本升级路由器系统或 Linux 内核。目前真机验证为 ImmortalWrt 25.12 x86_64 musl；其他架构尚未逐一真机验证。
+需要支持 nftables 的 OpenWrt 系统，内核应具备 TUN / nft queue。LuCI、Python 3.10+、curl 等依赖由当前系统仓库安装。旧版不支持的依赖、内核模块不匹配会停止安装。不会跨版本升级路由器系统或 Linux 内核。已验证环境包括 ImmortalWrt 25.12 x86_64、ImmortalWrt 24.10.2 i686 和 iStoreOS 22.03.6 x86_64；后两者为虚拟机环境，其他架构尚未逐一验证。
 
 | 系统架构 | 识别与下载 |
 | --- | --- |

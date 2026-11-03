@@ -1639,7 +1639,7 @@ def dependency_status():
     for package in DEPENDENCIES:
         args=['apk','info','-e',package] if manager=='apk' else ['opkg','status',package]
         r=sp.run(args,capture_output=True,text=True) if manager else None
-        installed=bool(r and r.returncode==0 and (manager=='apk' or re.search(r'^Status: (install|hold) (ok|user) installed$',r.stdout,re.M)))
+        installed=bool(r and r.returncode==0 and (manager=='apk' or re.search(r'^Status: (install|hold) (ok|user|hold)(,(ok|user|hold))* installed$',r.stdout,re.M)))
         if package=='nftables-json' and shutil.which('nft'):installed=True
         items.append({'package':package,'installed':installed})
     return {'manager':manager,'items':items,'ready':bool(manager) and all(x['installed'] for x in items)}

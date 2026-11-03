@@ -1,25 +1,23 @@
-# sing-box for OpenWrt v1.10.6
+# sing-box for OpenWrt v1.10.7
 
-本次为 **v1.10.5 的安装兼容性修复版**。上一版的功能（节点编辑、分享与二维码、多选、流量显示等）保持不变，本说明汇总相对 v1.10.5 的全部改动。
+本次为 **v1.10.6 的 iStoreOS / Python 3.10 兼容性修复版**。上一版功能（节点编辑、分享与二维码、多选、流量显示等）保持不变；v1.10.6 的 IPK 外层格式、目录条目与 crontab 初始化修复均已保留，此处不再作为新增。
 
 ## 修复
 
-- **IPK 外层格式**：继续使用 OpenWrt opkg 要求的 gzip/tar 容器，不使用 Debian ar。
-- **data.tar.gz 目录条目**：现在会在每个文件之前显式包含完整的父目录条目，修复全新系统安装时出现的大量 `wfopen: No such file or directory`。
-- **crontab 初始化**：首次安装在缺失时创建 `/etc/crontabs/root`，且不覆盖已有计划任务。
-- **opkg 依赖检测**：安装脚本和 LuCI 的依赖检测都兼容 opkg 的 `install user installed` 状态，避免把已安装依赖误报为缺失。
-- **一键安装命令**：在未预装 curl 的系统上使用 wget 回退。
+- **SHA-256 分块校验**：用流式分块读取替代 Python 3.11 才提供的 `hashlib.file_digest`，兼容 iStoreOS 自带的 Python 3.10。
+- **opkg 依赖检测**：安装脚本与 LuCI 依赖检测都支持 opkg 的 `hold`、`user` 等逗号分隔状态（例如 `Status: install hold,user installed`），不再把已安装依赖误报为缺失；仍拒绝 `reinstreq`、`not-installed` 等异常状态。
+- **文档**：README 最低 Python 版本改为 3.10，并补充已验证环境。
 
 ## 验证情况（如实记录）
 
-- 真实 OpenWrt opkg 隔离测试通过：全新解包、从失败的 1.10.5 升级恢复均正常。
-- 已在反馈者的 ImmortalWrt 24.10.2 i686 虚拟机完成安装：管理包 1.10.6，内核为 1.15.0-alpha.13 的 386-musl 版本。
-- 该虚拟机 GitHub API 下载失败，内核与官方面板通过离线上传提供；**未声称全流程在线下载已通过**。
-- **iStoreOS 尚未实机验证**。
+- 已在 iStoreOS 22.03.6、x86_64、Linux 5.10.201、Python 3.10.13 的 N100 / QEMU 环境重装管理包 1.10.7。
+- 两项针对性兼容检查通过：分块 SHA-256 校验、opkg 依赖状态识别。
+- 使用 `--no-core` 重装，保留原 1.15.0-alpha.13 内核和已安装面板；原节点配置、网络、DHCP/DNS、防火墙和面板设置保持不变。
+- 透明代理原本关闭，重装后保持关闭；**未验证该环境下的完整透明代理转发**。
 
 ## 升级
 
-- 从 v1.10.5（或更早的 v1.10.x）升级会保留 `/etc/sb-router` 配置、服务器设置与内核；本次仅修正打包目录条目、crontab 初始化与依赖检测，不改动运行逻辑。
+- 从 v1.10.6（或更早的 v1.10.x）升级会保留 `/etc/sb-router` 配置、服务器设置与内核；本次仅改核心校验、依赖检测与文档，不改动运行逻辑。
 
 ## 安装与校验
 
