@@ -12,7 +12,7 @@ OpenWrt / ImmortalWrt 的 sing-box LuCI 管理界面。管理包不包含内核�
 在路由器 SSH 中以 root 执行：
 
 ~~~sh
-curl -fL --proto '=https' --proto-redir '=https' https://raw.githubusercontent.com/being123321/sing-box-for-openwrt/main/install.sh -o /tmp/install-sb-router.sh && sh /tmp/install-sb-router.sh
+if command -v curl >/dev/null 2>&1; then curl -fL --proto '=https' --proto-redir '=https' https://raw.githubusercontent.com/being123321/sing-box-for-openwrt/main/install.sh -o /tmp/install-sb-router.sh; else wget -O /tmp/install-sb-router.sh https://raw.githubusercontent.com/being123321/sing-box-for-openwrt/main/install.sh; fi && sh /tmp/install-sb-router.sh
 ~~~
 
 脚本识别 OpenWrt / ImmortalWrt、APK / IPK 包管理器和 LAN 地址。内核下载器根据用户空间 ABI、CPU 架构和 musl 选择官方文件，并核验官方 SHA-256。默认最新测试版，稳定版加 --stable。没有官方适配包的架构会明确报错。

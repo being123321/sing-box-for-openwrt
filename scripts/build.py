@@ -3,19 +3,13 @@
 import argparse,hashlib,io,pathlib,shutil,subprocess,tarfile,tempfile
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 EXEC={'manage','dns-hook','setup.py','luci.sbrouter','sb-router','sb-ingress','sb-panels','sb-network-guard','sb-core-guard','sb-reverse-proxy'}
-def tar(items):
+def tar(items,sort=True):
     out=io.BytesIO()
     with tarfile.open(fileobj=out,mode='w:gz',format=tarfile.GNU_FORMAT) as t:
-        for name,data,mode in sorted(items):
+        for name,data,mode in (sorted(items) if sort else items):
             info=tarfile.TarInfo('./'+name);info.size=len(data);info.mode=mode;info.mtime=0
             t.addfile(info,io.BytesIO(data))
     return out.getvalue()
-def ar(items):
-    result=b'!<arch>\n'
-    for name,data in items:
-        result+=(f'{name+"/":<16}{0:<12}{0:<6}{0:<6}{"100644":<8}{len(data):<10}'+chr(96)+'\n').encode()+data
-        if len(data)%2:result+=b'\n'
-    return result
 def build(apk_tool=None):
     version=(ROOT/'VERSION').read_text().strip()
     dist=ROOT/'dist';dist.mkdir(exist_ok=True);items=[]
@@ -28,7 +22,12 @@ def build(apk_tool=None):
         items.append(('etc/sb-router/web-helpers/'+p.name,p.read_bytes().replace(b'\r\n',b'\n'),0o644))
     items.append(('etc/sb-router/install-helper.sh',(ROOT/'install.sh').read_bytes().replace(b'\r\n',b'\n'),0o755))
     control=f'Package: luci-app-sb-router\nVersion: {version}-1\nArchitecture: all\nDepends: luci-base, python3, python3-yaml, curl\nDescription: sing-box for OpenWrt management, core downloaded separately\nMaintainer: being123321\nSection: luci\n'.encode()
-    (dist/'luci-app-sb-router.ipk').write_bytes(ar([('debian-binary',b'2.0\n'),('control.tar.gz',tar([('control',control,0o644)])),('data.tar.gz',tar(items))]))
+    # OpenWrt opkg expects a gzip/tar outer archive, not Debian's ar container.
+    (dist/'luci-app-sb-router.ipk').write_bytes(tar([
+        ('debian-binary',b'2.0\n',0o644),
+        ('data.tar.gz',tar(items),0o644),
+        ('control.tar.gz',tar([('control',control,0o644)]),0o644),
+    ],sort=False))
     if apk_tool:
         with tempfile.TemporaryDirectory() as tmp:
             for name,data,mode in items:

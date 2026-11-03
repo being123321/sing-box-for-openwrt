@@ -1,42 +1,29 @@
-# sing-box for OpenWrt v1.10.4
+# sing-box for OpenWrt v1.10.5
 
-本次发布以 **v1.10.2** 为基准，汇总 **v1.10.3 与 v1.10.4** 中尚未发布的全部改动（v1.10.3 未单独发布）。管理包不含 sing-box 内核和个人配置；安装脚本自动识别 OpenWrt / ImmortalWrt、APK / IPK、LAN 地址、CPU 架构与 musl ABI，并单独下载官方内核。
+本次为 **v1.10.4 的安装修复版**。上一版的功能（节点编辑规则、分享与二维码、多选状态）保持不变，本说明仅列出相对 v1.10.4 的修复。
 
-## 节点编辑规则（1.10.4）
+## 修复
 
-- **本地节点直接保存**：手动添加的节点、本地配置里的节点修改后原位保存；改名时同步更新选择组，重名会被拒绝。
-- **只改跳过证书验证**：订阅和远程配置里的节点，如果只修改 `tls.insecure`，按原名保存为偏好；来源更新时保留这一设置，其他参数继续跟随来源更新。
-- **其他参数修改**：生成带「本地修改」后缀的受保护副本（重名自动追加 `-2`、`-3`），原节点继续随来源更新，副本不会被来源覆盖。
-- **受保护副本**：不受配置编辑里「更新时允许覆盖拖入的节点」影响，可继续编辑、重命名、单独删除或批量删除，刷新配置后不会重新出现。
-- **保存反馈**：保存后弹窗显示实际保存的名称，并说明本次修改是否会被来源更新覆盖。
-- **只提交改动字段**：节点表单现在只提交与原值不同的字段，保留未修改的高级参数（Reality、uTLS、ALPN、传输 headers 等）；高级 JSON 模式仍可整体编辑。
-- **自动迁移**：可识别的旧「仅证书验证」整节点覆盖设置会在来源更新前自动迁移为新的偏好存储，无需手动处理。
+- **IPK 外层格式**：由错误的 Debian ar 容器改为 OpenWrt opkg 要求的 gzip/tar 容器，内层依次为 `debian-binary`、`data.tar.gz`、`control.tar.gz`。旧格式在 opkg 系统上报 `pkg_init_from_file: Malformed package file`，现已修复；APK（apk-tools v3）打包方式不受影响。
+- **一键安装命令**：增加 wget 回退，未预装 curl 的系统也能直接运行安装脚本。
+- **内核架构识别**：继续按运行系统的用户空间 ABI / CPU 架构识别并下载内核，i686 虚拟机对应 386-musl，不会按物理机 N100 误下载 amd64。
 
-## 分享与二维码（1.10.3）
+## 验证与说明
 
-- **节点分享**：每个节点可生成 vless、vmess、trojan、shadowsocks、hysteria2、tuic、anytls、socks、http 分享链接，并显示可扫描的二维码；节点编辑窗口内也可直接分享。
-- **配置分享**：远程配置分享订阅来源链接；本地配置分享全部节点链接和 Base64 订阅文本；可直接查看并复制完整配置 JSON，或下载 `.json` 文件；内容较短时生成二维码。配置编辑窗口内也可直接分享。
-- **服务端分享**：服务器菜单生成的分享链接同时显示二维码。
-- 二维码在路由器本机使用内置 qrcodegen（MIT）生成，不访问网络、不上传节点或凭据。
+- 归档格式检查已通过：IPK 外层 gzip/tar 容器、control 版本、文件权限、payload 与源码一致性均已校验。
+- **尚未在反馈者的 opkg 实机（ImmortalWrt 24.10.2 i686 虚拟机）完成实装验证**，请升级后反馈安装结果。
+- 管理包不含 sing-box 内核和个人配置；安装脚本自动识别系统、包管理器、架构与依赖。
 
-## 多选状态（1.10.3）
+## 升级
 
-- 节点多选状态按来源（所有节点、每个订阅、每个配置）保存到 `/etc/sb-router/selection.json`，刷新页面、切换标签或展开其他配置后自动恢复。
-- 可继续批量删除或拖放；「清空选择」会同步清除保存的状态，已删除节点在下次加载时自动丢弃。
-
-## 升级注意
-
-- 从 **v1.10.2 升级**会保留 `/etc/sb-router` 配置、服务器设置、面板和内核；管理包不含内核和个人配置。
-- 首次编辑订阅或远程配置节点时无需额外操作：旧覆盖设置会在下一次来源更新前自动迁移。
-- 受保护副本可以自行重命名，但名称不能与现有节点重复；删除副本不会影响来源原节点。
-- 订阅下载仍为 180 秒等待；403 / 429 时保留原配置和上次余量并延后重试。
+- 从 v1.10.4（或更早的 v1.10.x）升级会保留 `/etc/sb-router` 配置、服务器设置与内核；本次仅修正安装包容器格式与安装命令，不改动运行逻辑。
 
 ## 安装与校验
 
 一键安装（root）：
 
 ~~~sh
-curl -fL --proto '=https' --proto-redir '=https' https://raw.githubusercontent.com/being123321/sing-box-for-openwrt/main/install.sh -o /tmp/install-sb-router.sh && sh /tmp/install-sb-router.sh
+if command -v curl >/dev/null 2>&1; then curl -fL --proto '=https' --proto-redir '=https' https://raw.githubusercontent.com/being123321/sing-box-for-openwrt/main/install.sh -o /tmp/install-sb-router.sh; else wget -O /tmp/install-sb-router.sh https://raw.githubusercontent.com/being123321/sing-box-for-openwrt/main/install.sh; fi && sh /tmp/install-sb-router.sh
 ~~~
 
-发布资产：`luci-app-sb-router.ipk`、`luci-app-sb-router.apk`、`install.sh`、`SHA256SUMS`。安装脚本从本仓库最新 Release 下载匹配包管理器的管理包，并校验 SHA-256。
+发布资产：`luci-app-sb-router.ipk`、`luci-app-sb-router.apk`、`install.sh`、`SHA256SUMS`。安装脚本从本仓库最新 Release 下载匹配包管理器的管理包并校验 SHA-256。
