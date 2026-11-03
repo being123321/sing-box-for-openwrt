@@ -7,6 +7,9 @@ CORE_FILE=
 NO_CORE=0
 DRY=0
 LOCAL_DIR=
+DEPS_ONLY=0
+CERT_DEPS=0
+PROXY_DEPS=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --stable) CHANNEL=stable ;;
@@ -16,6 +19,9 @@ while [ "$#" -gt 0 ]; do
         --source) [ "$#" -gt 1 ]; SOURCE=$2; shift ;;
         --local-dir) [ "$#" -gt 1 ]; LOCAL_DIR=$2; shift ;;
         --dry-run) DRY=1 ;;
+        --deps-only) DEPS_ONLY=1 ;;
+        --with-certificates) CERT_DEPS=1 ;;
+        --with-reverse-proxy) PROXY_DEPS=1 ;;
         *) echo "Unknown argument: $1"; exit 2 ;;
     esac
     shift
@@ -30,13 +36,80 @@ echo "System: $(ubus call system board 2>/dev/null | jsonfilter -e '@.release.de
 echo "CPU: $(uname -m); package manager: $PM; core channel: $CHANNEL"
 [ "$DRY" = 0 ] || exit 0
 [ "$(id -u)" = 0 ] || { echo "Run as root."; exit 1; }
-if [ "$PM" = apk ]; then
-    apk update
-    apk add luci-base python3 python3-yaml curl ca-bundle kmod-tun kmod-nft-queue nftables-json ip-full
-else
-    opkg update
-    opkg install luci-base python3 python3-yaml curl ca-bundle kmod-tun kmod-nft-queue nftables-json ip-full
-fi
+repair_official_feeds() {
+    board=$(ubus call system board)
+    dist=$(echo "$board" | jsonfilter -e '@.release.distribution' | tr 'A-Z' 'a-z')
+    ver=$(echo "$board" | jsonfilter -e '@.release.version')
+    target=$(echo "$board" | jsonfilter -e '@.release.target')
+    echo "$ver" | grep -Eq '^[0-9]{2}\.[0-9]{2}\.[0-9]+$' || { echo "Snapshot feeds cannot be mixed with release feeds."; return 1; }
+    case "$dist" in immortalwrt) base=https://downloads.immortalwrt.org ;; openwrt) base=https://downloads.openwrt.org ;; *) echo "Unknown distribution; refusing foreign package feeds."; return 1 ;; esac
+    case "$target" in *[!a-zA-Z0-9_/-]*|'') return 1 ;; esac
+    if [ "$PM" = apk ]; then
+        arch=$(apk --print-arch)
+        feed=/etc/apk/repositories.d/sb-router-official.list
+        suffix=packages.adb
+    else
+        arch=$(opkg print-architecture | awk '$2!="all" && $2!="noarch" {print $2}' | tail -n 1)
+        feed=/etc/opkg/sb-router-official.conf
+        suffix=
+    fi
+    case "$arch" in *[!a-zA-Z0-9_-]*|'') return 1 ;; esac
+    echo "Adding matching official feeds: $dist $ver $target $arch"
+    : > "$feed"
+    n=0
+    for path in "targets/$target/packages" "packages/$arch/base" "packages/$arch/luci" "packages/$arch/packages" "packages/$arch/routing" "packages/$arch/telephony"; do
+        n=$((n+1))
+        if [ "$PM" = apk ]; then echo "$base/releases/$ver/$path/$suffix" >> "$feed"
+        else echo "src/gz sb_router_official_$n $base/releases/$ver/$path" >> "$feed"; fi
+    done
+    # Keep the exact kmod ABI path already supplied by this firmware.
+    if [ "$PM" = apk ]; then
+        for original in /etc/apk/repositories.d/*.list; do [ "$original" != "$feed" ] || continue; grep '/kmods/' "$original" 2>/dev/null || true; done | while IFS= read -r line; do
+            path=$(echo "$line" | sed -n "s|^https://[^/]*/releases/$ver/targets/$target/kmods/|kmods/|p")
+            case "$path" in kmods/*/packages.adb) echo "$base/releases/$ver/targets/$target/$path" >> "$feed" ;; esac
+        done
+    fi
+    chmod 644 "$feed"
+}
+install_apk_dependencies() {
+    plan=$(apk add --simulate $MISSING 2>&1) || { echo "$plan"; return 1; }
+    if echo "$plan" | grep -qE '(Installing|Upgrading|Downgrading|Reinstalling) kernel([[:space:]]|$)'; then
+        echo "Kernel ABI mismatch. Refusing kernel replacement."
+        return 1
+    fi
+    apk add $MISSING
+}
+PACKAGES="luci-base python3 python3-yaml curl ca-bundle kmod-tun kmod-nft-queue nftables-json ip-full"
+[ "$CERT_DEPS" = 0 ] || PACKAGES="$PACKAGES openssl-util acme-acmesh acme-acmesh-dnsapi"
+[ "$PROXY_DEPS" = 0 ] || PACKAGES="$PACKAGES openssl-util haproxy"
+MISSING=
+for package in $PACKAGES; do
+    if [ "$package" = nftables-json ] && command -v nft >/dev/null 2>&1; then continue; fi
+    if [ "$PM" = apk ]; then
+        apk info -e "$package" >/dev/null 2>&1 && continue
+    else
+        opkg status "$package" 2>/dev/null | grep -q 'Status: install ok installed' && continue
+    fi
+    MISSING="$MISSING $package"
+done
+if [ -n "$MISSING" ]; then
+    echo "Installing missing dependencies:$MISSING"
+    if [ "$PM" = apk ]; then
+        apk update || true
+        if ! install_apk_dependencies; then repair_official_feeds; apk update || true; install_apk_dependencies; fi
+    else
+        opkg update || true
+        if ! opkg --noaction install $MISSING 2>&1 | grep -qE '(Installing|Upgrading) kernel '; then
+            if ! opkg install $MISSING; then
+                repair_official_feeds; opkg update || true
+                plan=$(opkg --noaction install $MISSING 2>&1 || true)
+                echo "$plan" | grep -qE '(Installing|Upgrading) kernel ' && { echo "Kernel ABI mismatch. Refusing kernel replacement."; exit 1; }
+                opkg install $MISSING
+            fi
+        else echo "Kernel ABI mismatch. Refusing kernel replacement."; exit 1; fi
+    fi
+else echo "All dependencies are installed."; fi
+[ "$DEPS_ONLY" = 0 ] || exit 0
 TMP=$(mktemp -d /tmp/sb-router-install.XXXXXX)
 trap 'rm -rf "$TMP"' EXIT HUP INT TERM
 if [ "$PM" = apk ]; then PACKAGE=luci-app-sb-router.apk
@@ -92,8 +165,17 @@ for base in ('/etc/sb-router','/etc/init.d','/usr/libexec/rpcd','/www/luci-stati
         if base=='/etc/init.d' and not target.name.startswith('sb-'):continue
         if base=='/usr/libexec/rpcd' and target.name!='luci.sbrouter':continue
         p.replace(target)
+# IPK payloads use reproducible timestamps; remove generated bytecode so equal-size
+# source updates cannot accidentally execute a previous version.
+cache=pathlib.Path('/etc/sb-router/__pycache__')
+if cache.is_dir():
+    for p in cache.glob('*.pyc'):
+        if p.is_file():p.unlink()
 PY
 python3 /etc/sb-router/setup.py init
+/etc/sb-router/manage cli migrate-item-updates
+/etc/sb-router/manage cli usage-schedule
+/etc/sb-router/manage cli refresh-usage
 if [ "$NO_CORE" = 0 ]; then
     if [ -n "$CORE_FILE" ]; then
         cp "$CORE_FILE" /tmp/sb-router-core-upload

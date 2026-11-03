@@ -5,10 +5,19 @@ STOP=11
 start_service() {
     [ -x /etc/sb-router/core ] || { logger -t sb-router 'core missing for this architecture; install it from LuCI'; return 1; }
     [ -s /etc/sb-router/active.json ] || return 1
+    /usr/bin/python3 /etc/sb-router/process_guard.py reset backend || return 1
     procd_open_instance
-    procd_set_param command /etc/sb-router/core run -D /etc/sb-router -c /etc/sb-router/active.json
+    procd_set_param command /usr/bin/python3 /etc/sb-router/process_guard.py run backend
     procd_set_param stderr 1
-    procd_set_param respawn
+    procd_set_param term_timeout 5
     procd_close_instance
+}
+
+boot() {
+    /usr/bin/python3 /etc/sb-router/process_guard.py allow-boot backend || {
+        logger -t sb-router 'automatic start is latched off after failed recovery; manual start required'
+        return 0
+    }
+    start "$@"
 }
 

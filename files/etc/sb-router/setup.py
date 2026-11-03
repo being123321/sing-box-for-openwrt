@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 """Create missing state only; preserve user configuration."""
+import re
 import ipaddress,json,os,pathlib,secrets,shutil,sys,tempfile,zipfile
 from router_platform import lan_address
 D=pathlib.Path('/etc/sb-router')
@@ -35,7 +36,14 @@ def panels():
     helpers=D/'web-helpers';failures=[]
     for name,(repo,ref) in PANELS.items():
         dest=D/'ui' if name=='official' else D/'panels'/name
-        if (dest/'index.html').exists():continue
+        if (dest/'index.html').exists():
+            if name=='official':
+                index=dest/'index.html';text=index.read_text()
+                text=re.sub(r'<script src="\./official-connect\.js[^"]*"></script>','',text)
+                text=text.replace('<head>','<head><script src="./official-connect.js?v=1.10.0-2"></script>',1);index.write_text(text)
+            for filename in (('official-connect.js',) if name=='official' else ('luci-connect.html','luci-connect.js')):
+                shutil.copyfile(helpers/filename,dest/filename)
+            continue
         try:
             with tempfile.TemporaryDirectory(dir=D,prefix='.panel-') as tmp:
                 archive=pathlib.Path(tmp)/'panel.zip'
@@ -53,7 +61,7 @@ def panels():
                 if not (stage/'index.html').exists():raise ValueError('Missing panel index')
                 if name=='official':
                     index=stage/'index.html'
-                    index.write_text(index.read_text().replace('<head>','<head><script src="./official-connect.js"></script>',1))
+                    index.write_text(index.read_text().replace('<head>','<head><script src="./official-connect.js?v=1.10.0-2"></script>',1))
                     shutil.copyfile(helpers/'official-connect.js',stage/'official-connect.js')
                 else:
                     for file in ('luci-connect.html','luci-connect.js'):shutil.copyfile(helpers/file,stage/file)

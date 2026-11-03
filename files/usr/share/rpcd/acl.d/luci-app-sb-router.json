@@ -10,7 +10,15 @@
           "panel",
           "node-list",
           "node-get",
-          "sub-list"
+          "sub-list",
+          "server-list",
+          "dependencies",
+          "telemetry",
+          "item-policy-get",
+          "proxy-list",
+          "site-status",
+          "runtime",
+          "usage-status"
         ]
       }
     },
@@ -55,7 +63,27 @@
           "update-options",
           "update-selection",
           "update-selected",
-          "update-policy"
+          "update-policy",
+          "server-get",
+          "server-save",
+          "server-delete",
+          "server-generate",
+          "dependencies-install",
+          "item-policy-set",
+          "item-update",
+          "certificates",
+          "certificate-issue",
+          "server-share",
+          "proxy-save",
+          "proxy-delete",
+          "site-check",
+          "profile-api",
+          "profile-api-set",
+          "profile-update",
+          "node-copy",
+          "copy-policy",
+          "nodes-delete",
+          "refresh-usage"
         ]
       },
       "file": {

@@ -2,7 +2,7 @@
 """Build architecture-independent management packages, never a sing-box core."""
 import argparse,hashlib,io,pathlib,shutil,subprocess,tarfile,tempfile
 ROOT=pathlib.Path(__file__).resolve().parents[1]
-EXEC={'manage','dns-hook','setup.py','luci.sbrouter','sb-router','sb-ingress','sb-panels','sb-network-guard','sb-core-guard'}
+EXEC={'manage','dns-hook','setup.py','luci.sbrouter','sb-router','sb-ingress','sb-panels','sb-network-guard','sb-core-guard','sb-reverse-proxy'}
 def tar(items):
     out=io.BytesIO()
     with tarfile.open(fileobj=out,mode='w:gz',format=tarfile.GNU_FORMAT) as t:
@@ -26,6 +26,7 @@ def build(apk_tool=None):
         items.append((relative,p.read_bytes().replace(b'\r\n',b'\n'),0o755 if p.name in EXEC else 0o644))
     for p in (ROOT/'assets').iterdir():
         items.append(('etc/sb-router/web-helpers/'+p.name,p.read_bytes().replace(b'\r\n',b'\n'),0o644))
+    items.append(('etc/sb-router/install-helper.sh',(ROOT/'install.sh').read_bytes().replace(b'\r\n',b'\n'),0o755))
     control=f'Package: luci-app-sb-router\nVersion: {version}-1\nArchitecture: all\nDepends: luci-base, python3, python3-yaml, curl\nDescription: sing-box for OpenWrt management, core downloaded separately\nMaintainer: being123321\nSection: luci\n'.encode()
     (dist/'luci-app-sb-router.ipk').write_bytes(ar([('debian-binary',b'2.0\n'),('control.tar.gz',tar([('control',control,0o644)])),('data.tar.gz',tar(items))]))
     if apk_tool:

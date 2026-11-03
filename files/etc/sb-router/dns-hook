@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 import fcntl,json,os,pathlib,socket,struct,subprocess as sp,sys,time
-from router_platform import api_url
+from router_platform import api_url, api_secret
 D=pathlib.Path('/etc/sb-router')
 state=D/'dns-before-proxy.json'
 section='dhcp.@dnsmasq[0]'
@@ -33,7 +33,7 @@ def internal_health():
         with socket.create_connection(('127.0.0.1',18082),timeout=2) as sock:
             sock.sendall(b'\x05\x01\x00')
             if sock.recv(2)!=b'\x05\x00':return False,'代理转发接口未响应'
-        token=(D/'token').read_text().strip()
+        token=api_secret()
         r=sp.run(['curl','--noproxy','*','-fsS','--max-time','2','-H','Authorization: Bearer '+token,
                   api_url('/version')],capture_output=True,timeout=4)
         if r.returncode:return False,'代理管理接口未响应'
@@ -98,6 +98,8 @@ def watch():
                     failed_since=None
                     set_mode(True)
                 else:
+                    from process_guard import recent_recovery
+                    if recent_recovery(D):failed_since=None;time.sleep(1);continue
                     with (D/'lock').open('a') as lock:
                         try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
                         except BlockingIOError:
@@ -142,9 +144,22 @@ def set_mode(up):
         for p in pathlib.Path('/tmp').glob('dnsmasq.*.d/sb-router-dns.conf'):p.unlink()
         sp.run(['/etc/init.d/dnsmasq','restart'],check=True,stdout=sp.DEVNULL,stderr=sp.DEVNULL)
         if not up:state.unlink(missing_ok=True)
+def emergency():
+    from process_guard import locked_roles
+    with (D/'lock').open('a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        if locked_roles(D) and (intent.exists() or state.exists() or pathlib.Path('/sys/class/net/sb-zh').exists()):
+            return fallback('连续三次自动恢复失败，已锁定重试；请检查后手动启动')
+
 if __name__=='__main__':
     mode=sys.argv[1]
-    if mode=='watch':watch()
+    if mode=='emergency':emergency()
+    elif mode=='retry-cleanup':
+        with (D/'lock').open('a') as lock:
+            try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            except BlockingIOError:sys.exit(75)
+            cleanup_capture()
+    elif mode=='watch':watch()
     elif mode=='up':
         for i in range(25):
             if pathlib.Path('/sys/class/net/sb-zh').exists() and resolver_alive():break

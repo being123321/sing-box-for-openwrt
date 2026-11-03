@@ -6,15 +6,24 @@ start_service() {
     [ -s /etc/sb-router/tun.json ] || return 1
     pidof honk-core >/dev/null && return 1
     touch /tmp/sb-router-wanted
+    /usr/bin/python3 /etc/sb-router/process_guard.py reset tun || return 1
     procd_open_instance
-    procd_set_param command /etc/sb-router/core run -D /etc/sb-router -c /etc/sb-router/tun.json
+    procd_set_param command /usr/bin/python3 /etc/sb-router/process_guard.py run tun
     procd_set_param stderr 1
-    procd_set_param respawn
+    procd_set_param term_timeout 5
     procd_close_instance
 }
 
 service_started() { /etc/sb-router/dns-hook up; }
 
 service_stopped() { rm -f /tmp/sb-router-wanted; /etc/sb-router/dns-hook down; }
+
+boot() {
+    /usr/bin/python3 /etc/sb-router/process_guard.py allow-boot tun || {
+        logger -t sb-router 'automatic start is latched off after failed recovery; manual start required'
+        return 0
+    }
+    start "$@"
+}
 
 

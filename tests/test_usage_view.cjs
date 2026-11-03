@@ -1,0 +1,11 @@
+const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict'),path=require('node:path');
+const source=fs.readFileSync(path.join(__dirname,'../files/www/luci-static/resources/view/sb-router/main.js'),'utf8');
+const fn=source.slice(source.indexOf('    function usageView(value){'),source.indexOf('    var quotaTargets='));
+const scope={E:(tag,attrs,text)=>({tag,hidden:Object.hasOwn(attrs,'hidden'),attrs,text}),size:n=>String(n)};
+vm.createContext(scope);vm.runInContext(fn,scope);
+assert.equal(scope.usageView({provided:false}).hidden,true);
+assert.equal(scope.usageView({provided:true,remainingText:'741.54 GB',expireText:'长期有效'}).hidden,false);
+assert.equal(scope.usageView({provided:true,remaining:0}).hidden,false);
+assert.equal(scope.usageView({provided:true}).hidden,true);
+assert.doesNotMatch(scope.usageView({provided:true,expireText:'长期有效'}).text,/未提供/);
+console.log('Quota note visibility: data, missing fields and zero balance passed');

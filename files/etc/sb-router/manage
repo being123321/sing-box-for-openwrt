@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 import base64, fcntl, hashlib, json, os, pathlib, re, secrets, shutil, subprocess as sp, sys, tempfile, time, urllib.parse
 
-from router_platform import lan_address, api_url
+from router_platform import lan_address, api_url, api_secret
 LAN = lan_address()
 D = pathlib.Path('/etc/sb-router')
 profiles = D / 'profiles'
@@ -30,17 +30,29 @@ def save(path, data):
     os.replace(tmp, path)
 
 
-def fetch(url):
+def fetch(url,subscription=True):
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme != 'https' or not parsed.hostname:
         raise ValueError('需要 HTTPS 链接')
+    import subscription_usage
+    if subscription:subscription_usage.check_fetch(D,url)
     for extra in (['--proxy', 'http://127.0.0.1:18081'], ['--noproxy', '*']):
-        r = sp.run(['curl', '-4fsSL', *extra, '--proto', '=https', '--proto-redir', '=https',
-                    '--connect-timeout', '5', '--max-time', '40', '--max-filesize', '33554432',
-                    '-A', 'SFA (sing-box 1.15.0-alpha.13)', url], capture_output=True)
-        if r.returncode == 0:
-            return r.stdout
-    raise ValueError('下载失败：' + parsed.hostname)
+        with tempfile.TemporaryDirectory(prefix='sb-fetch-') as folder:
+            header_path=pathlib.Path(folder)/'headers';body_path=pathlib.Path(folder)/'body'
+            r=sp.run(['curl','-4fsSL','-D',str(header_path),'-o',str(body_path),'-w','%{http_code}',*extra,
+                      '--proto','=https','--proto-redir','=https','--connect-timeout','15' if subscription else '5',
+                      '--max-time','180' if subscription else '40','--max-filesize','33554432',
+                      '-A','SFA (sing-box 1.15.0-alpha.13)',url],capture_output=True)
+            headers=header_path.read_text(errors='replace') if header_path.exists() else ''
+            code=r.stdout.decode(errors='replace').strip()
+            if subscription and code in ('403','429'):
+                subscription_usage.rate_limit(D,url,int(code),headers)
+                raise ValueError('订阅网站暂时限制访问（HTTP '+code+'），已保留原配置和余量，稍后再更新。')
+            if r.returncode==0 and body_path.exists():
+                body=body_path.read_bytes()
+                if subscription:subscription_usage.record(D,url,headers,body)
+                return body
+    raise ValueError('下载失败：'+parsed.hostname+'；已保留原配置，请稍后重试')
 
 
 def validate(name):
@@ -57,7 +69,7 @@ def check(cfg):
     return p
 
 
-def render(src):
+def render(src, name=None):
     cfg = json.loads(src)
     cfg['inbounds'] = [dict(type='socks', tag='lan-forward', listen='127.0.0.1', listen_port=18082),
                        dict(type='direct', tag='router-dns', listen='127.0.0.1', listen_port=15353)]
@@ -68,14 +80,8 @@ def render(src):
     dns = cfg.setdefault('dns', {})
     dns.setdefault('rules', [])
     dns.setdefault('servers', [])
-    legacy_path = D / 'before-cutover' / 'original-sing-box.json'
-    if not legacy_path.exists():
-        legacy_path = D / 'ingress-extra.json'
-    legacy = json.loads(legacy_path.read_bytes()) if legacy_path.exists() else {
-        'inbounds': [dict(type='http',tag='local-http',listen='127.0.0.1',listen_port=18081)],
-        'outbounds': [dict(type='direct',tag='ingress-direct')],
-        'route': {'final':'ingress-direct'},
-        'dns': {'servers':[dict(type='udp',tag='bootstrap-local',server='223.5.5.5')]}}
+    from server_manager import legacy_config
+    legacy = legacy_config()
     tags = [x['tag'] for x in legacy['inbounds']]
     old_final = legacy['route']['final']
     if any(x.get('tag') in tags for x in cfg['inbounds']) or any(x.get('tag') == old_final for x in cfg['outbounds']):
@@ -91,7 +97,7 @@ def render(src):
     for rs in route.get('rule_set', []):
         if rs.get('type') != 'remote':
             continue
-        raw = fetch(rs['url'])
+        raw = fetch(rs['url'],subscription=False)
         if rs.get('format') == 'source':
             json.loads(raw)
         directory = D / 'rules'
@@ -106,28 +112,23 @@ def render(src):
         if x.get('tag') == 'PROXY' and x['type'] == 'selector':
             x['interrupt_exist_connections'] = True
 
-    token = D / 'token'
-    if not token.exists():
-        save(token, secrets.token_urlsafe(32).encode())
+    import profile_api
     ex = cfg.setdefault('experimental', {})
     ex['cache_file'] = {'enabled': True, 'path': str(D / 'cache.db')}
-    ex['clash_api'] = {'external_controller': LAN + ':9090', 'external_ui': str(D / 'ui'),
-                       'secret': token.read_text(), 'access_control_allow_origin': ['http://' + LAN + ':9090', 'http://' + LAN + ':9091', 'http://' + LAN + ':9092', 'http://' + LAN + ':9093', 'http://' + LAN + ':9094']}
-    cfg['services'] = [s for s in cfg.get('services', []) if s.get('tag') != 'router-dashboard']
-    cfg['services'].append(dict(type='api', tag='router-dashboard', listen=LAN, listen_port=9091,
-                                secret=token.read_text(),
-                                access_control_allow_origin=['http://' + LAN + ':9090', 'http://' + LAN + ':9091', 'http://' + LAN + ':9092', 'http://' + LAN + ':9093', 'http://' + LAN + ':9094'], dashboard=str(D / 'ui')))
+    prefs=profile_api.settings(D,name,cfg,LAN) if name else dict(port=9090,secret=api_secret() or secrets.token_urlsafe(32))
+    profile_api.patch(cfg,prefs,LAN,D)
     cfg['dns']['rules'].insert(0, dict(query_type=['AAAA'], action='predefined', rcode='NOERROR'))
     settings = json.loads((D/'system.json').read_text()) if (D/'system.json').exists() else {}
     domains = settings.get('ipv6_direct_domains',[])
     if domains and any(x.get('tag')=='daed-dns' for x in cfg['dns']['servers']):
         cfg['dns']['rules'].insert(0, dict(domain_suffix=domains, query_type=['AAAA'], action='route', server='daed-dns'))
-    return check(cfg)
+    from server_manager import configure
+    return check(configure(cfg, legacy))
 
 
 def healthy():
     for _ in range(20):
-        r = sp.run(['curl', '-fsS', '--max-time', '2', '-H', 'Authorization: Bearer ' + (D / 'token').read_text(),
+        r = sp.run(['curl', '-fsS', '--max-time', '2', '-H', 'Authorization: Bearer ' + api_secret(),
                     api_url('/version')], capture_output=True)
         if r.returncode == 0:
             return True
@@ -171,7 +172,7 @@ def base_rule(name):
     raw = None
     for candidate in (url, 'https://gh-proxy.com/' + url):
         try:
-            raw = fetch(candidate)
+            raw = fetch(candidate,subscription=False)
             break
         except Exception:
             continue
@@ -284,6 +285,7 @@ def base_sub_list():
 
 
 def base_sub_del(name):
+    original=(profiles/'base.json').read_bytes()
     obj = read_obj('base')
     before = len(obj.get('subs') or [])
     obj['subs'] = [x for x in obj.get('subs') or [] if x.get('name') != name]
@@ -296,6 +298,11 @@ def base_sub_del(name):
     else:
         obj['nodeCount'] = 0
         save(profiles / 'base.json', json.dumps(obj, ensure_ascii=False).encode())
+    try:prune_item_updates()
+    except Exception:
+        save(profiles/'base.json',original)
+        if active_name()=='base':install('base',True)
+        raise
     return {'ok': True}
 
 
@@ -371,11 +378,11 @@ def set_token(arg):
         raise ValueError('密钥至少 16 个字符')
     if not re.fullmatch(r'[A-Za-z0-9_=+/.-]+', value):
         raise ValueError('密钥只能包含字母、数字和 _ = + / . -')
-    save(D / 'token', value.encode())
-    selected = (D / 'selected').read_text().strip() if (D / 'selected').exists() else ''
-    if selected:
-        install(selected, True)
-    return {'token': value}
+    selected=active_name()
+    if not selected:raise ValueError('请先选择配置')
+    prefs=profile_api_action({'name':selected})
+    result=profile_api_action(dict(name=selected,port=prefs['port'],secret=value,reset=False),True)
+    return {'token':result['secret']}
 
 
 def add_nodes(cfg, nodes):
@@ -449,6 +456,7 @@ def profile_config(obj):
         cfg = json.loads(json.dumps(obj['config']))
         if obj.get('nodes'):
             add_nodes(cfg, obj['nodes'])
+    cfg = merge_copied(cfg, obj.get('copiedNodes', []))
     return apply_node_edits(cfg, obj)
 
 
@@ -619,7 +627,7 @@ def profile_action(method, arg, name):
             raise ValueError('配置不存在')
         obj = json.loads(original)
         return dict(value=json.dumps(profile_config(obj), ensure_ascii=False, indent=2), revision=revision,
-                    remote='url' in obj, url=obj.get('url',''))
+                    remote='url' in obj, url=obj.get('url',''), copyOverwrite=bool(obj.get('copyOverwrite')), copiedCount=len(obj.get('copiedNodes',[])))
     if method == 'editprofile':
         dest = arg['dest']
         validate(dest)
@@ -639,6 +647,7 @@ def profile_action(method, arg, name):
                 raise ValueError('该链接不是完整 sing-box 配置，请从导入入口添加节点')
             obj['url']=url
             obj['config']=cfg
+            obj['copyOverwrite']=bool(arg.get('copyOverwrite',obj.get('copyOverwrite',False)))
             render(json.dumps(profile_config(obj)).encode())
             obj['nodeCount']=len(node_objects(profile_config(obj)))
             save(target,json.dumps(obj,ensure_ascii=False).encode())
@@ -653,7 +662,7 @@ def profile_action(method, arg, name):
             raise ValueError('订阅请另存为本地副本')
         if target != path and target.exists():
             raise ValueError('目标名称已存在')
-        obj = {'config': json.loads(arg['value'])}
+        obj = {'config': json.loads(arg['value']), 'copyOverwrite':bool(arg.get('copyOverwrite',False))}
     elif method == 'nodes':
         nodes = json.loads(arg['value'])
         if not isinstance(nodes, list) or not nodes:
@@ -682,21 +691,22 @@ def profile_action(method, arg, name):
     return {'ok': True}
 
 
-def install(name, activate):
+def install(name, activate, force=False):
     obj = json.loads((profiles / (name + '.json')).read_bytes())
-    candidate = render(json.dumps(profile_config(obj)).encode())
+    candidate = render(json.dumps(profile_config(obj)).encode(), name)
     if not activate:
         return
     active = D / 'active.json'
     old = active.read_bytes() if active.exists() else None
-    if old and json.loads(old) == json.loads(candidate.read_bytes()) and healthy():
+    if not force and old and json.loads(old) == json.loads(candidate.read_bytes()) and healthy():
         candidate.unlink()
         save(D / 'selected', name.encode())
         return
+    previous_pid=core_pid()
     os.replace(candidate, active)
     try:
         sp.run(['/etc/init.d/sb-ingress', 'restart'], check=True)
-        if not healthy():
+        if not wait_backend(previous_pid):
             raise RuntimeError('服务健康检查失败')
         for url in ['https://www.baidu.com', 'https://www.gstatic.com/generate_204']:
             sp.run(['curl', '--proxy', 'http://127.0.0.1:18081', '-fsSL', '--retry', '3', '--retry-connrefused',
@@ -704,8 +714,9 @@ def install(name, activate):
     except Exception:
         if old:
             save(active, old)
-            sp.run(['/etc/init.d/sb-ingress', 'restart'])
-        raise
+            rollback_pid=core_pid();sp.run(['/etc/init.d/sb-ingress', 'restart'])
+            if not wait_backend(rollback_pid):raise RuntimeError('原配置已恢复，但服务仍未启动；网络保护会恢复直连')
+        raise RuntimeError('新配置启动或连通检测失败，已恢复原配置与服务')
     save(D / 'selected', name.encode())
 
 
@@ -770,9 +781,13 @@ def control(start):
     running = pathlib.Path('/sys/class/net/sb-zh').exists()
     if start and running:
         return {'ok': True, 'message': '已在运行'}
-    if (not start) and (not running):
+    if (not start) and (not running) and __import__('process_guard').load(D,'tun').get('phase') not in ('starting','recovering','running'):
         return {'ok': True, 'message': '已停止'}
     if start:
+        ensure_dependencies()
+        if not core_pid() or __import__('process_guard').load(D,'backend').get('locked'):
+            sp.run(['/etc/init.d/sb-ingress','restart'],check=True)
+            if not healthy():raise RuntimeError('后台启动失败，请检查异常记录')
         sp.run([INIT, 'start'], check=True)
         if not healthy() or not pathlib.Path('/sys/class/net/sb-zh').exists():
             raise RuntimeError('启动失败，请检查服务日志')
@@ -816,8 +831,8 @@ def kernel_version():
 
 
 def clash_get(path):
-    r = sp.run(['curl', '-fsS', '--max-time', '6', '-H', 'Authorization: Bearer ' + (D / 'token').read_text(),
-                'http://' + LAN + ':9090' + path], capture_output=True)
+    r = sp.run(['curl', '-fsS', '--max-time', '6', '-H', 'Authorization: Bearer ' + api_secret(),
+                api_url(path)], capture_output=True)
     if r.returncode:
         raise ValueError('内核接口不可用')
     return json.loads(r.stdout)
@@ -874,7 +889,8 @@ def node_set(name, tag, value):
                 dels.append(tag)
     else:
         original['config'] = cfg
-    save(target, json.dumps(original, ensure_ascii=False).encode())
+    original['copiedNodes']=[node if x.get('tag')==tag else x for x in original.get('copiedNodes',[])]
+    write_profile(name,original)
     return {'ok': True}
 
 
@@ -898,7 +914,8 @@ def node_del(name, tag):
         original.get('nodeOverrides', {}).pop(tag, None)
     else:
         original['config'] = cfg
-    save(path, json.dumps(original, ensure_ascii=False).encode())
+    original['copiedNodes']=[x for x in original.get('copiedNodes',[]) if x.get('tag')!=tag]
+    write_profile(name,original)
     return {'ok': True}
 
 
@@ -979,7 +996,7 @@ def profiles_info():
             if count is None:
                 count = count_nodes(obj)
             out.append({'name': path.stem, 'kind': kind, 'url': obj.get('suburl') or obj.get('url') or '',
-                        'nodes': count, 'active': path.stem == active})
+                        'nodes': count, 'active': path.stem == active, 'copyOverwrite':bool(obj.get('copyOverwrite')), 'copiedCount':len(obj.get('copiedNodes',[])), 'usage':usage_info(obj.get('suburl') or obj.get('url') or '',path.stem)})
         except Exception:
             out.append({'name': path.stem, 'kind': 'local', 'url': '', 'nodes': 0, 'active': path.stem == active})
     return out
@@ -995,43 +1012,31 @@ def profile_delete(name):
     path = profiles / (name + '.json')
     if not path.exists():
         raise ValueError('配置不存在')
-    path.unlink()
+    original=path.read_bytes();path.unlink()
+    try:prune_item_updates()
+    except Exception:save(path,original);raise
     return {'ok': True}
 
 
 def panel_state():
-    path = D / 'panel.json'
-    data = {'id': 'official', 'url': ''}
-    if path.exists():
-        try:
-            data.update(json.loads(path.read_bytes()))
-        except Exception:
-            pass
-    known = {p['id'] for p in PANELS}
-    if data.get('id') not in known:
-        data['id'] = 'official'
-        data['url'] = ''
-    return {'id': data.get('id', 'official'), 'url': data.get('url', ''), 'panels': PANELS,
-            'link': panel_link(data.get('id', 'official'), data.get('url', ''))}
+    import panel_registry
+    return panel_registry.state(D, PANELS, panel_link)
 
 
 def panel_set(arg):
-    pid = arg.get('id', 'official')
-    if pid not in {p['id'] for p in PANELS}:
-        raise ValueError('面板无效')
-    url = (arg.get('url') or '').strip()
-    link = panel_link(pid, url)
-    save(D / 'panel.json', json.dumps({'id': pid, 'url': url}, ensure_ascii=False).encode())
-    return {'ok': True, 'link': link, 'id': pid, 'url': url, 'panels': PANELS}
+    import panel_registry
+    return panel_registry.update(D, PANELS, panel_link, arg)
 
 
 def logs(arg):
     limit = max(10, min(int(arg.get('lines', 300)), 2000))
-    r = sp.run(['logread', '-e', 'core'], capture_output=True, text=True)
+    r = sp.run(['logread', '-e', 'core|sb-router|sb-network|sb-reverse'], capture_output=True, encoding='utf-8', errors='replace', text=True)
     lines = r.stdout.splitlines() if r.stdout else []
     if not lines:
         r = sp.run(['logread'], capture_output=True, text=True)
         lines = r.stdout.splitlines()
+    ansi=re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)')
+    lines=[re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]','',ansi.sub('',x)) for x in lines]
     return {'lines': lines[-limit:], 'total': len(lines)}
 
 
@@ -1121,18 +1126,18 @@ def catalog():
     return entries
 
 def catalog_public():
-    return {'nodes': [dict(id=x['id'], owner=x['owner'], source=x['source'],
+    return {'configNodes':config_nodes_public(), 'nodes': [dict(id=x['id'], owner=x['owner'], source=x['source'],
                            tag=x['node']['tag'], type=x['node']['type'],
                            server=x['node']['server'], port=x['node']['server_port'])
                       for x in catalog()],
             'subscriptions': [dict(id='base:' + s['name'], name=s['name'], url=s['url'],
-                                   count=sum(x['source'] == s['name'] and x['owner'] == 'base' for x in catalog()))
+                                   usage=usage_info(s['url']), count=sum(x['source'] == s['name'] and x['owner'] == 'base' for x in catalog()))
                               for s in read_obj('base').get('subs', [])]
-                             + [dict(id='profile:' + p['name'], name=p['name'], url=p['url'], count=p['nodes'])
+                             + [dict(id='profile:' + p['name'], name=p['name'], url=p['url'], count=p['nodes'],usage=p.get('usage',{}))
                                 for p in profiles_info() if p['kind'] == 'subscription']}
 
 def find_entry(identity):
-    return next((x for x in catalog() if x['id'] == identity), None)
+    return next((x for x in catalog()+config_entries() if x['id'] == identity), None)
 
 def change_catalog(arg, delete=False):
     entry = find_entry(arg['id'])
@@ -1361,7 +1366,11 @@ def commit_import(arg):
     data = json.loads(p.read_bytes())
     name = arg['name'].strip()
     validate(name)
+    originals={q:q.read_bytes() if q.exists() else None for q in [profiles/'base.json',profiles/(name+'.json')]}
+    previous_active=(D/'active.json').read_bytes() if (D/'active.json').exists() else None
     mode = arg['mode']
+    import item_updates
+    policy=item_updates.validate(json.loads(arg.get('policy','{}')))
     if mode == 'config':
         if not data['config']:
             raise ValueError('此文件仅支持导入节点')
@@ -1390,6 +1399,17 @@ def commit_import(arg):
         write_profile('base', obj)
     else:
         raise ValueError('导入方式无效')
+    if data['url']:
+        identity=('profile:' if mode=='config' else 'sub:')+name
+        try:item_updates.set_policy(identity,policy,[x['id'] for x in update_items()])
+        except Exception:
+            for q,raw in originals.items():
+                if raw is None:q.unlink(missing_ok=True)
+                else:save(q,raw)
+            active_path=D/'active.json'
+            if previous_active is not None and active_path.read_bytes()!=previous_active:
+                save(active_path,previous_active);sp.run(['/etc/init.d/sb-ingress','restart']);healthy()
+            raise
     p.unlink()
     return {'ok': True}
 
@@ -1462,6 +1482,12 @@ def probe_catalog(scope):
                 proc.kill()
                 proc.wait()
 
+def prune_item_updates():
+    if not (D/'item-updates.json').exists():return
+    import item_updates
+    allowed=[x['id'] for x in update_items()]
+    item_updates.sync({k:v for k,v in item_updates.read().items() if k in allowed},allowed)
+
 def update_items():
     subs = read_obj('base').get('subs', [])
     items = [dict(id='sub:' + s['name'], name=s['name'], kind='订阅节点') for s in subs]
@@ -1487,8 +1513,8 @@ def save_update_selection(value):
     save(UPDATE_FILE, json.dumps({'selected': list(dict.fromkeys(selected))}, ensure_ascii=False).encode())
     return {'ok': True}
 
-def update_selected():
-    chosen = update_options()['selected']
+def update_selected(chosen=None, activate=True):
+    chosen = update_options()['selected'] if chosen is None else chosen
     old_base = read_obj('base')
     updated_base = json.loads(json.dumps(old_base))
     staged = {}
@@ -1509,7 +1535,9 @@ def update_selected():
                     obj['nodes'] = sub_parse(fetch(obj['suburl']).decode('utf-8-sig'))
                 else:
                     obj['config'] = json.loads(fetch(obj['url']))
-                render(json.dumps(profile_config(obj)).encode())
+                if obj.get('copyOverwrite'):
+                    for copied in obj.pop('copiedNodes',[]):obj.get('nodeOverrides',{}).pop(copied['tag'],None)
+                render(json.dumps(profile_config(obj)).encode(),name)
                 staged[name] = obj
             successful.append(identity)
         except Exception as exc:
@@ -1524,26 +1552,34 @@ def update_selected():
             backups[name] = path.read_bytes()
             obj['nodeCount'] = len(node_objects(profile_config(obj)))
             save(path, json.dumps(obj, ensure_ascii=False).encode())
-        if active in staged:
-            install(active, True)
+        if active in staged and activate:
+            install(active, True, force=True)
     except Exception:
         for name, raw in backups.items():
             save(profiles / (name + '.json'), raw)
         raise
-    return {'ok': not errors, 'updated': successful, 'failures': errors}
+    return {'ok': not errors, 'updated': successful, 'failures': errors, 'deferred':active in staged and not activate}
 
 PANELS = [dict(id='official', name='SagerNet 官方面板'),
           dict(id='yacd', name='Yacd Meta'), dict(id='metacubexd', name='MetaCubeXD'),
           dict(id='zashboard', name='Zashboard'), dict(id='custom', name='自定义 HTTPS 地址')]
 
-def panel_link(pid, url):
-    token = (D / 'token').read_text()
-    if pid == 'official':
-        return 'http://' + LAN + ':9091/dashboard/#router-secret=' + urllib.parse.quote(token)
+def panel_link(pid, url, name=None):
+    import profile_api
+    name=name or active_name()
+    prefs=profile_api.settings(D,name,profile_config(read_obj(name)),LAN) if name else dict(port=9090,secret=api_secret())
+    token=prefs['secret']
+    if pid in ('official','overview'):
+        port=9091 if pid=='official' else 9095
+        return 'http://' + LAN + ':' + str(port) + '/dashboard/#router-secret=' + urllib.parse.quote(token)
     ports = {'yacd':9092,'metacubexd':9093,'zashboard':9094}
     if pid in ports:
-        return 'http://' + LAN + ':' + str(ports[pid]) + '/luci-connect.html#' + urllib.parse.urlencode({'token':token,'kind':pid})
-    return url + ('&' if '?' in url else '?') + urllib.parse.urlencode(dict(hostname=LAN,port=9090,secret=token))
+        return 'http://' + LAN + ':' + str(ports[pid]) + '/luci-connect.html#' + urllib.parse.urlencode({'token':token,'kind':pid,'port':prefs['port']})
+    parsed = urllib.parse.urlsplit(url)
+    query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    query = [(k, v) for k, v in query if k not in ('hostname', 'port', 'secret')]
+    query.extend(dict(hostname=LAN, port=prefs['port'], secret=token).items())
+    return urllib.parse.urlunsplit(parsed._replace(query=urllib.parse.urlencode(query)))
 
 
 def save_update_policy(arg):
@@ -1578,8 +1614,257 @@ def configure_strict_route():
     os.replace(tmp, path)
 
 
+DEPENDENCIES=['luci-base','python3','python3-yaml','curl','ca-bundle','kmod-tun','kmod-nft-queue','nftables-json','ip-full']
+
+def dependency_status():
+    manager='apk' if shutil.which('apk') else ('opkg' if shutil.which('opkg') else '')
+    items=[]
+    for package in DEPENDENCIES:
+        args=['apk','info','-e',package] if manager=='apk' else ['opkg','status',package]
+        r=sp.run(args,capture_output=True,text=True) if manager else None
+        installed=bool(r and r.returncode==0 and (manager=='apk' or 'Status: install ok installed' in r.stdout))
+        if package=='nftables-json' and shutil.which('nft'):installed=True
+        items.append({'package':package,'installed':installed})
+    return {'manager':manager,'items':items,'ready':bool(manager) and all(x['installed'] for x in items)}
+
+def ensure_dependencies():
+    current=dependency_status()
+    if current['ready']:return dict(current,message='依赖已齐全')
+    helper=D/'install-helper.sh'
+    if not helper.exists():raise ValueError('依赖安装器缺失，请重新运行一键安装脚本')
+    result=sp.run(['/bin/sh',str(helper),'--deps-only'],capture_output=True,text=True,timeout=300)
+    current=dependency_status()
+    if result.returncode or not current['ready']:
+        raise ValueError('自动安装依赖失败，请检查软件源和当前系统内核模块版本：'+(result.stderr or result.stdout)[-400:])
+    return dict(current,message='缺少的依赖已安装')
+
+def wait_backend(previous_pid):
+    for attempt in range(30):
+        pid=core_pid()
+        if pid and pid!=previous_pid:return healthy()
+        time.sleep(.3)
+    return False
+
+def server_change(arg,delete=False):
+    import server_manager as servers
+    proposed=servers.proposed(arg,delete)
+    path=D/'servers.json';active=D/'active.json'
+    previous=path.read_bytes() if path.exists() else None
+    old_active=active.read_bytes() if active.exists() else None
+    old_tags=[x['id'] for x in servers.entries()]
+    previous_pid=core_pid();was_running=bool(previous_pid);changed=False
+    try:
+        save(path,json.dumps(proposed,ensure_ascii=False).encode())
+        if old_active:
+            candidate=check(servers.configure(json.loads(old_active),previous_tags=old_tags))
+        else:
+            candidate=render(json.dumps({'outbounds':[{'type':'direct','tag':'DIRECT'}]}).encode())
+        os.replace(candidate,active);changed=True
+        sp.run(['/etc/init.d/sb-ingress','restart'],check=True)
+        if not wait_backend(previous_pid):raise RuntimeError('服务端启动检查失败')
+        listed=servers.status(core_pid())
+        row=next((x for x in listed['servers'] if x['id']==arg.get('id') or x['id']==json.loads(arg.get('value','{}')).get('tag')),None)
+        if not delete and row and row['enabled'] and not row['running']:
+            raise RuntimeError('服务端端口未监听，已回退')
+        import managed_firewall
+        managed_firewall.sync()
+        return dict(ok=True,**listed)
+    except Exception:
+        if previous is None:path.unlink(missing_ok=True)
+        else:save(path,previous)
+        if changed:
+            if old_active is None:active.unlink(missing_ok=True)
+            else:save(active,old_active)
+            sp.run(['/etc/init.d/sb-ingress','restart' if was_running else 'stop'])
+            if was_running:healthy()
+        raise
+
+def usage_info(url,name=None):
+    from subscription_usage import info
+    return info(D,url or ('profile:'+name if name else ''))
+
+def merge_copied(cfg,nodes):
+    if not nodes:return cfg
+    existing={n.get('tag') for n in cfg.get('outbounds',[])}
+    for copied in nodes:
+        match=next((n for n in cfg['outbounds'] if n.get('tag')==copied.get('tag')),None)
+        if match is not None:
+            if match.get('type') not in PROXY_TYPES:raise ValueError('复制节点标签与来源策略组冲突，已保留原配置：'+copied['tag'])
+            match.clear();match.update(json.loads(json.dumps(copied)))
+    extras=[json.loads(json.dumps(n)) for n in nodes if n.get('tag') not in existing]
+    if not extras:return cfg
+    if not any(x.get('type')=='selector' for x in cfg['outbounds']):
+        tag='COPIED';i=2
+        while tag in existing:tag='COPIED-'+str(i);i+=1
+        cfg['outbounds'].append(dict(type='selector',tag=tag,outbounds=[n['tag'] for n in extras]))
+    add_nodes(cfg,extras)
+    return cfg
+
+def config_entries():
+    rows=[]
+    for path in sorted(profiles.glob('*.json')):
+        obj=json.loads(path.read_bytes())
+        if 'base' in obj or 'suburl' in obj:continue
+        for node in node_objects(profile_config(obj)):
+            rows.append(dict(id=node_key(path.stem,'config',node['tag']),owner=path.stem,source='@config',original=node['tag'],node=node))
+    return rows
+
+def config_nodes_public():
+    return [dict(id=e['id'],owner=e['owner'],source=e['source'],tag=e['node']['tag'],type=e['node']['type'],server=e['node'].get('server',''),port=e['node'].get('server_port',0)) for e in config_entries()]
+
+def copy_nodes(arg):
+    identities=json.loads(arg.get('ids','[]'))
+    if not isinstance(identities,list) or not identities or len(identities)>1024:raise ValueError('请选择 1–1024 个节点')
+    all_entries={x['id']:x for x in catalog()+config_entries()}
+    if any(x not in all_entries for x in identities):raise ValueError('节点来源已改变，请刷新后重试')
+    target=arg.get('target','')
+    name=target[8:] if target.startswith('profile:') else 'base'
+    if target!='all' and not target.startswith(('profile:','subscription:')):raise ValueError('复制目标无效')
+    obj=read_obj(name);cfg=profile_config(obj);used={x.get('tag') for x in cfg.get('outbounds',[])}
+    incoming=[]
+    for identity in dict.fromkeys(identities):
+        node=json.loads(json.dumps(all_entries[identity]['node']));original=node['tag'];index=2
+        while node['tag'] in used:node['tag']=original+'-copy-'+str(index);index+=1
+        used.add(node['tag']);validate_node(node);incoming.append(node)
+    if name=='base':obj.setdefault('nodes',[]).extend(incoming)
+    else:
+        obj.setdefault('copiedNodes',[]).extend(incoming);obj['copyOverwrite']=bool(arg.get('overwrite'))
+    write_profile(name,obj)
+    return dict(ok=True,count=len(incoming),target=name)
+
+def profile_api_action(arg,change=False):
+    import profile_api
+    name=arg.get('name') or active_name();obj=read_obj(name);cfg=profile_config(obj)
+    path=D/'profile-api.json';old=path.read_bytes() if path.exists() else None
+    if change:
+        active=D/'active.json';previous=active.read_bytes() if active.exists() else None;changed=False;pid=core_pid()
+        try:
+            prefs=profile_api.change(D,name,cfg,LAN,arg)
+            if name==active_name() and previous:
+                candidate=check(profile_api.patch(json.loads(previous),prefs,LAN,D));os.replace(candidate,active);changed=True
+                sp.run(['/etc/init.d/sb-ingress','restart'],check=True)
+                if not wait_backend(pid):raise ValueError('面板监听启动失败')
+        except Exception:
+            if old is None:path.unlink(missing_ok=True)
+            else:save(path,old)
+            if changed:
+                save(active,previous);pid=core_pid();sp.run(['/etc/init.d/sb-ingress','restart']);wait_backend(pid)
+            raise ValueError('保存失败，已恢复原面板端口、密钥和配置')
+    prefs=profile_api.settings(D,name,cfg,LAN)
+    prefs['link']=panel_link(panel_state()['id'],panel_state()['url'],name)
+    return prefs
+
+def delete_nodes_batch(arg):
+    ids=json.loads(arg.get('ids','[]'))
+    if not isinstance(ids,list) or not ids or len(ids)>1024:raise ValueError('请选择要删除的节点')
+    entries={e['id']:e for e in catalog()+config_entries()}
+    if any(identity not in entries for identity in ids):raise ValueError('节点列表已改变，请刷新后重试')
+    staged={};backups={}
+    for identity in dict.fromkeys(ids):
+        entry=entries[identity];name=entry['owner'];obj=staged.setdefault(name,read_obj(name));tag=entry['original']
+        if name=='base':
+            if entry['source']:
+                sub=next(x for x in obj['subs'] if x['name']==entry['source']);sub.setdefault('deleted',[]).append(tag);sub.get('overrides',{}).pop(tag,None)
+            else:obj['nodes']=[n for n in obj.get('nodes',[]) if (n.get('tag') or n.get('server'))!=tag]
+        else:
+            obj['copiedNodes']=[n for n in obj.get('copiedNodes',[]) if n.get('tag')!=tag]
+            if 'url' in obj or 'suburl' in obj:
+                obj.setdefault('nodeDels',[]).append(tag);obj.get('nodeOverrides',{}).pop(tag,None)
+            else:
+                cfg=obj['config'];cfg['outbounds']=[n for n in cfg['outbounds'] if n.get('tag')!=tag]
+                for group in cfg['outbounds']:
+                    if group.get('type') in ('selector','urltest'):
+                        group['outbounds']=[x for x in group.get('outbounds',[]) if x!=tag]
+                        if group.get('default')==tag:group.pop('default',None)
+    for name,obj in staged.items():
+        if name=='base' and not base_all_nodes(obj):
+            if name==active_name():raise ValueError('正在使用的基础配置至少保留一个节点')
+            obj['nodeCount']=0;continue
+        cfg=profile_config(obj);render(json.dumps(cfg).encode(),name);obj['nodeCount']=len(node_objects(cfg))
+    try:
+        for name,obj in staged.items():
+            path=profiles/(name+'.json');backups[name]=path.read_bytes();save(path,json.dumps(obj,ensure_ascii=False).encode())
+        if active_name() in staged:install(active_name(),True)
+    except Exception:
+        for name,raw in backups.items():save(profiles/(name+'.json'),raw)
+        raise
+    return dict(ok=True,count=len(set(ids)))
+
 def action(method, arg):
     name = arg.get('name', '')
+    if method in ('site-status','site-check'):
+        import site_checks
+        return site_checks.check(active_name()) if method=='site-check' else site_checks.snapshot()
+    if method in ('profile-api','profile-api-set'):
+        return profile_api_action(arg,method=='profile-api-set')
+    if method == 'node-copy':return copy_nodes(arg)
+    if method == 'nodes-delete':return delete_nodes_batch(arg)
+    if method == 'runtime':return dict(uptime=uptime_seconds(),**__import__('process_guard').snapshot(D))
+    if method == 'copy-policy':
+        obj=read_obj(name);obj['copyOverwrite']=bool(arg.get('overwrite'));save(profiles/(name+'.json'),json.dumps(obj,ensure_ascii=False).encode());return {'ok':True}
+    if method == 'profile-update':
+        obj=read_obj(name)
+        identities=['sub:'+x['name'] for x in obj.get('subs',[])] if 'base' in obj else ['profile:'+name] if ('url' in obj or 'suburl' in obj) else []
+        if not identities:raise ValueError('该配置没有可更新的远程来源')
+        return update_selected(identities)
+
+    if method == 'certificates':
+        import certificates
+        return certificates.scan()
+    if method == 'certificate-issue':
+        import certificates
+        return certificates.issue(arg)
+    if method == 'server-share':
+        from server_share import share
+        return share(arg)
+    if method == 'proxy-list':
+        import reverse_proxy
+        return reverse_proxy.list_items()
+    if method in ('proxy-save','proxy-delete'):
+        import reverse_proxy
+        return reverse_proxy.save(arg,method=='proxy-delete')
+    if method == 'usage-status':
+        from usage_refresh import status
+        return status(D)
+    if method == 'refresh-usage':
+        from usage_refresh import refresh
+        return refresh(D,force=arg.get('force',False))
+    if method == 'usage-schedule':
+        from usage_refresh import ensure_cron
+        return ensure_cron()
+    if method == 'telemetry':
+        from telemetry import snapshot
+        return snapshot()
+    if method == 'item-policy-get':
+        from item_updates import get
+        return {'policy':get(arg['id'])}
+    if method == 'item-policy-set':
+        from item_updates import set_policy
+        return set_policy(arg['id'],json.loads(arg['policy']),[x['id'] for x in update_items()])
+    if method == 'migrate-item-updates':
+        from item_updates import migrate
+        migrate(update_items(),update_options())
+        return {'ok':True}
+    if method in ('refresh-item','item-update'):
+        identity=bytes.fromhex(name).decode() if method=='refresh-item' else arg['id']
+        if identity not in {x['id'] for x in update_items()}:return {'ok':True,'updated':[],'failures':[]}
+        activate=method!='refresh-item' or not __import__('process_guard').locked_roles(D)
+        return update_selected([identity],activate=activate)
+    if method == 'server-list':
+        from server_manager import status
+        return status(core_pid())
+    if method == 'server-get':
+        from server_manager import get
+        return get(arg['id'])
+    if method in ('server-save','server-delete'):
+        return server_change(arg,method=='server-delete')
+    if method == 'server-generate':
+        from server_manager import generate
+        return generate(arg['kind'])
+    if method == 'dependencies':
+        return dependency_status()
+    if method == 'dependencies-install':
+        return ensure_dependencies()
     if method == 'catalog':
         return catalog_public()
     if method == 'catalog-get':
@@ -1606,7 +1891,7 @@ def action(method, arg):
     if method == 'update-policy':
         return save_update_policy(arg)
     if method in ('update-selected', 'refresh-selected', 'refresh-nodes', 'refresh-config'):
-        return update_selected()
+        return update_selected(activate=method=='update-selected' or not __import__('process_guard').locked_roles(D))
     if method == 'strict-route':
         configure_strict_route()
         return {'ok': True}
@@ -1623,10 +1908,10 @@ def action(method, arg):
                     profileList=profiles_info(),
                     active=(D / 'selected').read_text() if (D / 'selected').exists() else '',
                     running=pathlib.Path('/sys/class/net/sb-zh').exists(),
-                    uptime=uptime_seconds(), kernel=kernel_version(), panel=panel_state(),
-                    coreUpdate=__import__('core_update').preferences())
+                    uptime=uptime_seconds(), kernel=kernel_version(), panel=panel_state(), nativeOverview=panel_link('overview',''),
+                    coreUpdate=__import__('core_update').preferences(), runtime=__import__('process_guard').snapshot(D))
     if method == 'token':
-        return {'token': (D / 'token').read_text()}
+        return {'token': api_secret()}
     if method == 'schedule':
         return set_schedule(arg.get('kind', 'nodes'), arg)
     if method == 'autostart':
@@ -1696,7 +1981,7 @@ def action(method, arg):
             obj = {'url': arg['value']}
             raw = fetch(obj['url'])
         else:
-            obj = {'config': json.loads(arg['value'])}
+            obj = {'config': json.loads(arg['value']), 'copyOverwrite':bool(arg.get('copyOverwrite',False))}
             raw = arg['value'].encode()
         if not isinstance(json.loads(raw).get('outbounds'), list):
             raise ValueError('需要完整 sing-box JSON')
@@ -1720,7 +2005,7 @@ if sys.argv[1] == 'list':
 try:
     with (D / 'lock').open('w') as lock:
         method = sys.argv[2]
-        if method not in ('status', 'token', 'logs', 'profiles', 'panel', 'node-list', 'node-delay', 'node-get', 'catalog', 'catalog-get', 'update-options'):
+        if method not in ('status', 'token', 'logs', 'profiles', 'panel', 'node-list', 'node-delay', 'node-get', 'catalog', 'catalog-get', 'update-options','telemetry','usage-status','item-policy-get','server-list','dependencies'):
             fcntl.flock(lock, fcntl.LOCK_EX)
         arg = json.load(sys.stdin) if sys.argv[1] == 'call' else {'name': sys.argv[3] if len(sys.argv) > 3 else ''}
         print(json.dumps(action(method, arg), ensure_ascii=False))

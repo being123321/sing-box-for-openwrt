@@ -3,19 +3,24 @@ import json, os, pathlib, secrets, subprocess, sys
 M = '/etc/sb-router/manage'
 methods = {
     'kernel': {'mode': '', 'source': '', 'channel': '', 'version': '', 'sha256': ''},
-    'readprofile': {'name': ''}, 'editprofile': {'name': '', 'dest': '', 'revision': '', 'value': '', 'url': '', 'source': False},
+    'readprofile': {'name': ''}, 'editprofile': {'name': '', 'dest': '', 'revision': '', 'value': '', 'url': '', 'source': False, 'copyOverwrite': False},
     'nodes': {'name': '', 'value': '', 'new': True},
     'schedule': {'kind': 'nodes', 'enabled': True, 'mode': 'daily', 'weekday': 1, 'day': 1, 'hour': 0, 'minute': 0},
     'autostart': {'enabled': True}, 'refresh': {}, 'start': {}, 'stop': {}, 'restart': {}, 'status': {}, 'token': {},
     'job': {'id': ''}, 'link': {'name': '', 'value': ''}, 'upload': {'name': '', 'value': ''}, 'apply': {'name': ''},
-    'profiles': {}, 'logs': {'lines': 300}, 'panel': {}, 'panel-set': {'id': '', 'url': ''},
+    'profiles': {}, 'logs': {'lines': 300}, 'panel': {}, 'panel-set': {'id': '', 'url': '', 'name': ''},
     'node-list': {'name': ''}, 'node-delay': {'name': ''}, 'node-get': {'name': '', 'tag': ''},
     'node-set': {'name': '', 'tag': '', 'value': ''}, 'node-del': {'name': '', 'tag': ''},
     'delete': {'name': ''}, 'sublink': {'name': '', 'url': '', 'new': True}, 'refresh-counts': {}, 'base-mode': {'mode': ''}, 'token-set': {'token': ''},
     'sub-list': {}, 'sub-add': {'name': '', 'url': ''}, 'sub-del': {'name': ''}, 'sub-refresh': {'name': ''},
 }
-methods.update({'catalog': {}, 'catalog-get': {'id': ''}, 'catalog-set': {'id': '', 'value': ''}, 'catalog-del': {'id': ''}, 'manual-add': {'value': ''}, 'import-inspect': {'url': '', 'value': ''}, 'import-commit': {'ticket': '', 'name': '', 'mode': ''}, 'catalog-delay': {'scope': 'all'}, 'update-options': {}, 'update-selection': {'selected': '[]'}, 'update-selected': {}, 'update-policy': {'selected': '[]', 'enabled': True, 'mode': 'daily', 'weekday': 1, 'day': 1, 'hour': 2, 'minute': 0}})
-SYNC = {'status', 'token', 'logs', 'profiles', 'panel', 'node-list', 'node-get', 'sub-list', 'catalog', 'catalog-get', 'update-options'}
+methods.update({'catalog': {}, 'catalog-get': {'id': ''}, 'catalog-set': {'id': '', 'value': ''}, 'catalog-del': {'id': ''}, 'manual-add': {'value': ''}, 'import-inspect': {'url': '', 'value': ''}, 'import-commit': {'ticket': '', 'name': '', 'mode': '', 'policy': '{}'}, 'catalog-delay': {'scope': 'all'}, 'update-options': {}, 'update-selection': {'selected': '[]'}, 'update-selected': {}, 'update-policy': {'selected': '[]', 'enabled': True, 'mode': 'daily', 'weekday': 1, 'day': 1, 'hour': 2, 'minute': 0}})
+methods.update({'server-list':{},'server-get':{'id':''},'server-save':{'id':'','revision':'','value':'','enabled':True,'route':'direct','firewall':True},
+                'server-delete':{'id':'','revision':''},'server-generate':{'kind':'password'},'dependencies':{},'dependencies-install':{}})
+methods.update({'telemetry':{},'item-policy-get':{'id':''},'item-policy-set':{'id':'','policy':'{}'},'item-update':{'id':''},'certificates':{},'certificate-issue':{'domain':'','email':'','provider':'cloudflare','token':'','agree':False},'server-share':{'id':'','host':'','user':0},'proxy-list':{},'proxy-save':{'id':'','domain':'','target':'','port':443,'https':True,'certificate':'','key':'','enabled':True,'firewall':True},'proxy-delete':{'id':''}})
+methods.update({'usage-status':{},'refresh-usage':{'force':True},'runtime':{},'nodes-delete':{'ids':'[]'},'site-status':{},'site-check':{},'profile-api':{'name':''},'profile-api-set':{'name':'','port':9090,'secret':'','reset':False},'profile-update':{'name':''},'node-copy':{'ids':'[]','target':'','overwrite':False},'copy-policy':{'name':'','overwrite':False}})
+
+SYNC = {'usage-status','runtime','site-status','profile-api','status', 'token', 'logs', 'profiles', 'panel', 'node-list', 'node-get', 'sub-list', 'catalog', 'catalog-get', 'update-options','server-list','server-get','dependencies','telemetry','item-policy-get','proxy-list'}
 if sys.argv[1] == 'list':
     print(json.dumps(methods))
     sys.exit()

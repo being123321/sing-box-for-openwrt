@@ -1,4 +1,4 @@
-from router_platform import api_url
+from router_platform import api_url, api_secret
 import hashlib
 import json
 import os
@@ -108,7 +108,7 @@ def restart(binary,tun):
         subprocess.run(['/etc/init.d/'+svc,'restart'],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
     for attempt in range(24):
         if live(binary,ROOT/'active.json') and (not tun or live(binary,ROOT/'tun.json')):
-            r=subprocess.run(['curl','--max-time','2','-fsS','-H','Authorization: Bearer '+(ROOT/'token').read_text(),api_url('/version')],capture_output=True)
+            r=subprocess.run(['curl','--max-time','2','-fsS','-H','Authorization: Bearer '+api_secret(),api_url('/version')],capture_output=True)
             if r.returncode==0 and version(binary) in json.loads(r.stdout).get('version',''):
                 r=subprocess.run(['curl','--max-time','8','--proxy','http://127.0.0.1:18081','-fsS','-o','/dev/null','https://www.gstatic.com/generate_204'],capture_output=True)
                 if not r.returncode:return
