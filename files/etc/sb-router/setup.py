@@ -4,6 +4,8 @@ import re
 import ipaddress,json,os,pathlib,secrets,shutil,sys,tempfile,zipfile
 from router_platform import lan_address
 D=pathlib.Path('/etc/sb-router')
+# Cache-busting version for the injected panel helpers; keep in step with VERSION.
+HELPER_VERSION='1.10.2'
 PANELS={'official':('SagerNet/sing-box-dashboard','gh-pages'),'yacd':('MetaCubeX/Yacd-meta','gh-pages'),
         'metacubexd':('MetaCubeX/metacubexd','gh-pages'),'zashboard':('Zephyruso/zashboard','gh-pages')}
 
@@ -40,7 +42,7 @@ def panels():
             if name=='official':
                 index=dest/'index.html';text=index.read_text()
                 text=re.sub(r'<script src="\./official-connect\.js[^"]*"></script>','',text)
-                text=text.replace('<head>','<head><script src="./official-connect.js?v=1.10.0-2"></script>',1);index.write_text(text)
+                text=text.replace('<head>','<head><script src="./official-connect.js?v='+HELPER_VERSION+'"></script>',1);index.write_text(text)
             for filename in (('official-connect.js',) if name=='official' else ('luci-connect.html','luci-connect.js')):
                 shutil.copyfile(helpers/filename,dest/filename)
             continue
@@ -61,7 +63,7 @@ def panels():
                 if not (stage/'index.html').exists():raise ValueError('Missing panel index')
                 if name=='official':
                     index=stage/'index.html'
-                    index.write_text(index.read_text().replace('<head>','<head><script src="./official-connect.js?v=1.10.0-2"></script>',1))
+                    index.write_text(index.read_text().replace('<head>','<head><script src="./official-connect.js?v='+HELPER_VERSION+'"></script>',1))
                     shutil.copyfile(helpers/'official-connect.js',stage/'official-connect.js')
                 else:
                     for file in ('luci-connect.html','luci-connect.js'):shutil.copyfile(helpers/file,stage/file)

@@ -99,7 +99,7 @@ class RuntimeTests(FeatureTests):
         for name in module.PANELS:
             dest=self.d/'ui' if name=='official' else self.d/'panels'/name;dest.mkdir(parents=True);(dest/'index.html').write_text('<head><script src="./official-connect.js?v=old"></script></head>')
         module.panels();index=(self.d/'ui/index.html').read_text()
-        self.assertEqual(index.count('official-connect.js'),1);self.assertIn('?v=1.9.1',index)
+        self.assertEqual(index.count('official-connect.js'),1);self.assertIn('?v='+module.HELPER_VERSION,index)
         self.assertEqual((self.d/'ui/official-connect.js').read_text(),'new-helper')
         self.assertEqual((self.d/'panels/yacd/luci-connect.js').read_text(),'new-helper')
 
