@@ -22,5 +22,16 @@ class IpkTests(unittest.TestCase):
                 with tarfile.open(fileobj=io.BytesIO(outer.extractfile('./data.tar.gz').read()),mode='r:gz') as data:
                     self.assertEqual(data.getmember('./etc/sb-router/manage').mode,0o755)
                     self.assertFalse(any(pathlib.PurePosixPath(n).name in ('core','token','active.json','tun.json') for n in data.getnames()))
+                    # opkg's extractor opens files directly; it does not create missing parents.
+                    # Simulate an empty root using mkdir only for explicit tar directory entries.
+                    empty=root/'empty-root';empty.mkdir()
+                    for member in data:
+                        dest=empty/member.name
+                        if member.isdir():dest.mkdir(exist_ok=True)
+                        elif member.isfile():
+                            self.assertTrue(dest.parent.is_dir(),'Missing directory entry before '+member.name)
+                            dest.write_bytes(data.extractfile(member).read())
+                    self.assertTrue((empty/'etc/sb-router/manage').is_file())
+                    self.assertTrue((empty/'etc/sb-router/install-helper.sh').is_file())
 
 if __name__=='__main__':unittest.main()

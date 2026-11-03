@@ -3,9 +3,14 @@
 import argparse,hashlib,io,pathlib,shutil,subprocess,tarfile,tempfile
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 EXEC={'manage','dns-hook','setup.py','luci.sbrouter','sb-router','sb-ingress','sb-panels','sb-network-guard','sb-core-guard','sb-reverse-proxy'}
-def tar(items,sort=True):
+def tar(items,sort=True,directories=False):
     out=io.BytesIO()
     with tarfile.open(fileobj=out,mode='w:gz',format=tarfile.GNU_FORMAT) as t:
+        if directories:
+            parents={str(parent) for name,_,_ in items for parent in pathlib.PurePosixPath(name).parents if str(parent)!='.'}
+            for name in sorted(parents,key=lambda p:(len(pathlib.PurePosixPath(p).parts),p)):
+                info=tarfile.TarInfo('./'+name+'/');info.type=tarfile.DIRTYPE;info.mode=0o755;info.mtime=0
+                t.addfile(info)
         for name,data,mode in (sorted(items) if sort else items):
             info=tarfile.TarInfo('./'+name);info.size=len(data);info.mode=mode;info.mtime=0
             t.addfile(info,io.BytesIO(data))
@@ -25,7 +30,7 @@ def build(apk_tool=None):
     # OpenWrt opkg expects a gzip/tar outer archive, not Debian's ar container.
     (dist/'luci-app-sb-router.ipk').write_bytes(tar([
         ('debian-binary',b'2.0\n',0o644),
-        ('data.tar.gz',tar(items),0o644),
+        ('data.tar.gz',tar(items,directories=True),0o644),
         ('control.tar.gz',tar([('control',control,0o644)]),0o644),
     ],sort=False))
     if apk_tool:

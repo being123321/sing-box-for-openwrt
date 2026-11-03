@@ -5,7 +5,7 @@ import ipaddress,json,os,pathlib,secrets,shutil,sys,tempfile,zipfile
 from router_platform import lan_address
 D=pathlib.Path('/etc/sb-router')
 # Cache-busting version for the injected panel helpers; keep in step with VERSION.
-HELPER_VERSION='1.10.5'
+HELPER_VERSION='1.10.6'
 PANELS={'official':('SagerNet/sing-box-dashboard','gh-pages'),'yacd':('MetaCubeX/Yacd-meta','gh-pages'),
         'metacubexd':('MetaCubeX/metacubexd','gh-pages'),'zashboard':('Zephyruso/zashboard','gh-pages')}
 

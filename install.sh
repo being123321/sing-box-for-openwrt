@@ -88,7 +88,7 @@ for package in $PACKAGES; do
     if [ "$PM" = apk ]; then
         apk info -e "$package" >/dev/null 2>&1 && continue
     else
-        opkg status "$package" 2>/dev/null | grep -q 'Status: install ok installed' && continue
+        opkg status "$package" 2>/dev/null | grep -qE '^Status: (install|hold) (ok|user) installed$' && continue
     fi
     MISSING="$MISSING $package"
 done
@@ -173,6 +173,11 @@ if cache.is_dir():
         if p.is_file():p.unlink()
 PY
 python3 /etc/sb-router/setup.py init
+# Fresh OpenWrt images may not have a root crontab until the first job is saved.
+mkdir -p /etc/crontabs
+if [ ! -f /etc/crontabs/root ]; then
+    (umask 077; : > /etc/crontabs/root)
+fi
 /etc/sb-router/manage cli migrate-item-updates
 /etc/sb-router/manage cli usage-schedule
 /etc/sb-router/manage cli refresh-usage
